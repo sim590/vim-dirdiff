@@ -186,6 +186,18 @@ let s:DirDiffJobCmdArg = ""
 " parallelism; streaming always applies the same way regardless.  -1
 " when none is active.
 let s:DirDiffStatusBufNr = -1
+" Minimum time, in seconds (see reltime()/reltimefloat()), between two
+" successive "visual refreshes" (window switch + :redraw) triggered by
+" s:DirDiffStreamAppend().  See that function's comment for why this
+" throttle exists.
+let s:DirDiffRedrawThrottleSec = 0.12
+" reltime() value of the last visual refresh s:DirDiffStreamAppend()
+" actually performed.  An empty List is the "never refreshed yet"
+" sentinel, forcing the very first call of a fresh run to always
+" redraw immediately rather than waiting out the throttle above; reset
+" to that sentinel by s:DirDiffBuildSkeleton() at the start of every
+" run.
+let s:DirDiffLastRedrawTime = []
 " Minimal seam around jobstart()/jobstop() so the rest of the plugin
 " doesn't need to sprinkle has('nvim') checks everywhere.  Returns -1
 " when async execution isn't available/enabled, the same way callers
@@ -545,6 +557,11 @@ function! s:DirDiffBuildSkeleton(dirA, dirB, cmdarg) abort
     call writefile([], s:FilenameDiffWindow)
     silent exe "edit ".s:FilenameDiffWindow
     let s:DirDiffStatusBufNr = bufnr('%')
+    " Reset the redraw throttle's sentinel so the very first
+    " s:DirDiffStreamAppend() call of this fresh run always redraws
+    " immediately, regardless of how recently a previous (unrelated)
+    " run last refreshed the screen.
+    let s:DirDiffLastRedrawTime = []
     setlocal modifiable
 
     let headerLines = []
@@ -579,27 +596,57 @@ endfunction
 " rather than only once every job is done -- regardless of whether
 " there's a single job running or several fanned out concurrently.
 " "lines" may be empty (eg. just to refresh the progress counters); no
-" insertion happens in that case.  Mirrors the setlocal modifiable /
-" nomodifiable toggle pattern already used by
-" <SID>HighlightLine()/<SID>DeHighlightLine() on this same buffer.
+" insertion happens in that case.
+"
+" Line insertion itself operates directly on the buffer by number
+" (setbufvar()/appendbufline()/setbufline()) instead of switching to
+" it first: a fan-out sub-job comparing a subdirectory with many
+" entries can call this function hundreds or thousands of times in
+" quick succession as its stdout trickles in (eg. over a slow network
+" share, where "diff --brief" produces one line every few milliseconds
+" instead of all at once), and that insertion must stay cheap and
+" happen every single time regardless of how often the visual refresh
+" below ends up running.  See s:DirDiffRedrawThrottleSec just above
+" s:DirDiffLastRedrawTime's declaration for why the refresh itself is
+" rate-limited.
 function! s:DirDiffStreamAppend(lines) abort
     if s:DirDiffStatusBufNr <= 0 || !bufexists(s:DirDiffStatusBufNr)
         return
     endif
-    let savedWin = win_getid()
-    call <SID>GotoDiffWindow()
-    setlocal modifiable
+    call setbufvar(s:DirDiffStatusBufNr, '&modifiable', 1)
     if !empty(a:lines)
         " Insert right above the trailing progress line, so new
         " entries land right after the last one already shown, in
         " arrival order -- no full re-sort/rebuild happens here, see
         " s:DirDiffFinishStreaming() for the single sort pass done
         " once every job is done.
-        call append(line('$') - 1, a:lines)
+        call appendbufline(s:DirDiffStatusBufNr, nvim_buf_line_count(s:DirDiffStatusBufNr) - 1, a:lines)
     endif
-    call setline(line('$'), s:DirDiffProgressText())
-    setlocal nomodifiable
-    setlocal nomodified
+    call setbufline(s:DirDiffStatusBufNr, '$', s:DirDiffProgressText())
+    call setbufvar(s:DirDiffStatusBufNr, '&modifiable', 0)
+    call setbufvar(s:DirDiffStatusBufNr, '&modified', 0)
+
+    " The visual refresh (window switch + :redraw) is the expensive
+    " part -- a full synchronous screen repaint plus a window lookup/
+    " switch -- so it's only done at most once every
+    " s:DirDiffRedrawThrottleSec, no matter how often this function
+    " itself gets called in between.  Without this, a fan-out sub-job
+    " producing its output over a long stretch of wall-clock time (eg.
+    " a subdirectory with ~1000 entries diffed over a slow UNC share)
+    " could trigger hundreds of these per second; with several
+    " concurrent fan-out jobs all doing the same, the cumulative cost
+    " can starve that job's on_stdout processing badly enough that its
+    " stdout pipe backs up (GNU diff blocking on a full pipe writing
+    " its next line), making the whole run look stuck just shy of
+    " completion even though every job is, in fact, still progressing.
+    if !empty(s:DirDiffLastRedrawTime)
+                \ && reltimefloat(reltime(s:DirDiffLastRedrawTime)) < s:DirDiffRedrawThrottleSec
+        return
+    endif
+    let s:DirDiffLastRedrawTime = reltime()
+
+    let savedWin = win_getid()
+    call <SID>GotoDiffWindow()
     call win_gotoid(savedWin)
     redraw
 endfunction
