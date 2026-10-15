@@ -95,6 +95,27 @@ if !exists("g:DirDiffForceShell")
     let g:DirDiffForceShell = ""
 endif
 
+" Run the diff command asynchronously via NeoVim's jobstart(), instead of
+" the classic blocking ":!cmd" call.  Defaults to on under NeoVim, and is
+" simply ignored (always synchronous) under classic Vim, which has no
+" equivalent async job API usable here.
+if !exists("g:DirDiffAsync")
+    let g:DirDiffAsync = has('nvim')
+endif
+" Maximum number of concurrent diff jobs to run when fanning the
+" comparison out across the top-level entries of the two directories
+" (NeoVim only).  Clamped to the range [1, 64] when actually used.  A
+" value of 1 (the default) just runs a single diff job asynchronously,
+" without any fan-out.
+if !exists("g:DirDiffMaxJobs")
+    let g:DirDiffMaxJobs = 1
+endif
+" Optional per-job timeout, in milliseconds.  0 (the default) means no
+" timeout is enforced.
+if !exists("g:DirDiffJobTimeout")
+    let g:DirDiffJobTimeout = 0
+endif
+
 let g:DirDiffLangString = ""
 if (g:DirDiffForceLang != "")
     if has('win32') && !has('win32unix')
@@ -134,6 +155,85 @@ endif
 let s:DirDiffFirstDiffLine = 6
 let s:DirDiffALine = 1
 let s:DirDiffBLine = 2
+
+" -- Async job state (NeoVim only).  s:DirDiffGeneration is bumped every
+" time DirDiff() runs; it's captured by each job's callback at launch
+" time so that a callback belonging to a superseded run (eg. the user
+" pressed 'u' to update, or re-ran :DirDiff before the previous run
+" finished) can recognize itself as stale and no-op instead of touching
+" state/buffers that no longer apply.
+let s:DirDiffGeneration = 0
+" List of NeoVim job ids currently in flight, so DirDiffQuit()/Update()
+" can stop them.
+let s:DirDiffActiveJobs = []
+" Pending work items, each a {'cmd', 'desc', 'generation'} dict.
+let s:DirDiffJobQueue = []
+" Diff output lines accumulated across one or several jobs.
+let s:DirDiffResultLines = []
+" Progress counters, also used to know when every job is done.
+let s:DirDiffJobsTotal = 0
+let s:DirDiffJobsDone = 0
+" Context shared by the queue pump and the on_exit callback; set once per
+" DirDiff() invocation, before any job is started.
+let s:DirDiffJobMaxJobs = 1
+let s:DirDiffJobDirA = ""
+let s:DirDiffJobDirB = ""
+let s:DirDiffJobCmdArg = ""
+" Buffer number of the live result buffer shown while async jobs are
+" still running: either the minimal "Diffing..." scratch placeholder
+" (classic/single-job path, see s:DirDiffOpenStatusBuffer()), or the
+" fully-chromed fan-out skeleton that gets streamed into progressively
+" (see s:DirDiffBuildSkeleton()).  -1 when none is active.
+let s:DirDiffStatusBufNr = -1
+" Whether the current async run streams result lines into the buffer
+" progressively as each fan-out job finishes (1), as opposed to
+" replacing the whole buffer at once when the single result becomes
+" available (0: classic synchronous path, or a single async job with
+" no fan-out -- there's nothing to stream there, only one batch of
+" results ever arrives).  Only meaningful while an async run is in
+" flight.
+let s:DirDiffStreaming = 0
+" Minimal seam around jobstart()/jobstop() so the rest of the plugin
+" doesn't need to sprinkle has('nvim') checks everywhere.  Returns -1
+" when async execution isn't available/enabled, the same way callers
+" already treat a jobstart() failure.
+"
+" Mirrors the &shell swap that <SID>DirDiffExec() does for the
+" synchronous path: NeoVim resolves &shell/&shellcmdflag synchronously
+" at jobstart() call time to build the process argv, so a save/restore
+" done strictly around the jobstart() call (not around the job's whole
+" lifetime) is enough to honour g:DirDiffForceShell for async jobs too.
+function! s:JobStart(cmd, callbacks) abort
+    if !g:DirDiffAsync || !has('nvim')
+        return -1
+    endif
+    let shellChanged = (g:DirDiffForceShell != "")
+    if shellChanged
+        let shell_save = &shell
+        let &shell = g:DirDiffForceShell
+    endif
+    " jobstart() can throw synchronously (eg. E903 if &shell itself points
+    " to a nonexistent executable); guard with try/finally so &shell is
+    " always restored, and fold that failure into the same "-1 = could
+    " not start" contract the rest of the plugin already handles.
+    let jobId = -1
+    try
+        let jobId = jobstart(a:cmd, a:callbacks)
+    catch
+        let jobId = -1
+    finally
+        if shellChanged
+            let &shell = shell_save
+        endif
+    endtry
+    return jobId
+endfunction
+
+function! s:JobStop(id) abort
+    if a:id > 0
+        silent! call jobstop(a:id)
+    endif
+endfunction
 
 " -- Variables used in various utilities
 if has("unix")
@@ -207,15 +307,77 @@ function! <SID>DirDiff(srcA, srcB)
     let DirDiffAbsSrcA = substitute(DirDiffAbsSrcA, '\\$\|/$', '', '')
     let DirDiffAbsSrcB = substitute(DirDiffAbsSrcB, '\\$\|/$', '', '')
 
+    " A new run invalidates any async job still in flight from a previous
+    " one; bump the generation counter so stale callbacks can detect
+    " themselves and no-op (see s:DirDiffOnJobExit()).
+    let s:DirDiffGeneration = s:DirDiffGeneration + 1
+    let myGeneration = s:DirDiffGeneration
+
     let s:FilenameDiffWindow = tempname()
-    " We first write to that file
-    " Constructs the command line
-    let langStr = ""
-    let cmd = "!" . g:DirDiffLangString . "diff"
+    " Constructs the diff command-line arguments
+    let cmdarg = s:BuildDiffCmdArg()
+
+    if (!g:DirDiffAsync || !has('nvim'))
+        " ---- Classic, fully synchronous path (identical behaviour to
+        " before async support was added) ----
+        let cmd = "!" . g:DirDiffLangString . "diff" . cmdarg . " \"".DirDiffAbsSrcA."\" \"".DirDiffAbsSrcB."\""
+        let cmd = cmd." > \"".s:FilenameDiffWindow."\""
+
+        echo "Diffing directories, it may take a while..."
+        let error = <SID>DirDiffExec(cmd, 0)
+        if (error == 0)
+            redraw | echom "diff found no differences - directories match."
+            return
+        endif
+        let resultLines = filereadable(s:FilenameDiffWindow) ? readfile(s:FilenameDiffWindow) : []
+        call s:DirDiffFinalize(resultLines, DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg)
+        return
+    endif
+
+    " ---- Asynchronous path (NeoVim only) ----
+    let s:DirDiffResultLines = []
+    let s:DirDiffJobQueue = []
+    let s:DirDiffActiveJobs = []
+    let s:DirDiffJobsTotal = 0
+    let s:DirDiffJobsDone = 0
+    let s:DirDiffJobDirA = DirDiffAbsSrcA
+    let s:DirDiffJobDirB = DirDiffAbsSrcB
+    let s:DirDiffJobCmdArg = cmdarg
+    let s:DirDiffJobMaxJobs = max([1, min([64, g:DirDiffMaxJobs])])
+
+    if (s:DirDiffJobMaxJobs <= 1)
+        " Single job, equivalent to the synchronous command above, just
+        " non-blocking.  There's only ever one batch of results arriving
+        " at once here, so the minimal "Diffing..." placeholder buffer
+        " swapped out wholesale by s:DirDiffFinalize() once the job
+        " completes is perfectly adequate; there is nothing to stream
+        " progressively.
+        let s:DirDiffStreaming = 0
+        call s:DirDiffOpenStatusBuffer()
+        let cmd = g:DirDiffLangString . "diff" . cmdarg . " \"".DirDiffAbsSrcA."\" \"".DirDiffAbsSrcB."\""
+        call s:DirDiffQueueJob(cmd, DirDiffAbsSrcA." <-> ".DirDiffAbsSrcB, myGeneration)
+        let s:DirDiffJobsTotal = 1
+        call s:DirDiffPumpQueue(myGeneration)
+    else
+        " Fan-out: several jobs finish at different times, so build the
+        " final buffer's full UI shell immediately and stream each
+        " job's result lines into it as it completes (see
+        " s:DirDiffBuildSkeleton()/s:DirDiffStreamAppend() below).
+        let s:DirDiffStreaming = 1
+        call s:DirDiffBuildSkeleton(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg)
+        call s:DirDiffDispatchFanOut(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg, myGeneration)
+    endif
+endfunction
+
+" Builds the diff command-line arguments (everything except the two paths
+" being compared) from the plugin's global options.  Shared by the
+" single-job synchronous/async path and by every fan-out sub-job, so
+" :ChangeExcludes/:ChangeIgnore/:ChangeArguments keep applying everywhere.
+function! s:BuildDiffCmdArg() abort
     let cmdarg = " -r --brief"
 
     if (g:DirDiffIgnoreFileNameCase)
-	let cmdarg = cmdarg." --ignore-file-name-case"
+        let cmdarg = cmdarg." --ignore-file-name-case"
     endif
 
     " If variable is set, we ignore the case
@@ -231,58 +393,17 @@ function! <SID>DirDiff(srcA, srcB)
     if (g:DirDiffIgnore != "")
         let cmdarg = cmdarg.' -I"'.substitute(g:DirDiffIgnore, ',', '" -I"', 'g').'"'
     endif
-    " Prompt the user for additional arguments
-"    let addarg = input("Additional diff args (current =". cmdarg. "): ")
-    let addarg = ""
-    let cmd = cmd.cmdarg." ".addarg." \"".DirDiffAbsSrcA."\" \"".DirDiffAbsSrcB."\""
-    let cmd = cmd." > \"".s:FilenameDiffWindow."\""
+    return cmdarg
+endfunction
 
-    echo "Diffing directories, it may take a while..."
-    let error = <SID>DirDiffExec(cmd, 0)
-    if (error == 0)
-        redraw | echom "diff found no differences - directories match."
-        return
-    endif
-    silent exe "edit ".s:FilenameDiffWindow
-    echo "Defining [A] and [B] ... "
-    " We then do a substitution on the directory path
-    " We need to do substitution of the the LONGER string first, otherwise
-    " it'll mix up the A and B directory
-    if (strlen(DirDiffAbsSrcA) > strlen(DirDiffAbsSrcB))
-	    silent! exe "%s/".<SID>EscapeDirForRegex(DirDiffAbsSrcA)."/[A]/"
-	    silent! exe "%s/".<SID>EscapeDirForRegex(DirDiffAbsSrcB)."/[B]/"
-    else
-	    silent! exe "%s/".<SID>EscapeDirForRegex(DirDiffAbsSrcB)."/[B]/"
-	    silent! exe "%s/".<SID>EscapeDirForRegex(DirDiffAbsSrcA)."/[A]/"
-    endif
-    " In windows, diff behaves somewhat weirdly, for the appened path it'll
-    " use "/" instead of "\".  Convert this to \
-    if (has("win32"))
-        silent! %s/\//\\/g
-    endif
-
-    echo "Sorting entries ..."
-    " We then sort the lines if the option is set
-    if (g:DirDiffSort == 1)
-        1,$call <SID>Sort("s:Strcmp")
-    endif
-
-    " Put in spacer in front of each line
-    silent! %s/^/    /
-
-    " We then put the file [A] and [B] on top of the diff lines
-    call append(0, "[A]=". DirDiffAbsSrcA)
-    call append(1, "[B]=". DirDiffAbsSrcB)
-    if get(g:, 'DirDiffEnableMappings', 0)
-        call append(2, "Usage:   <Enter>/'o'=open,'s'=sync,'<Leader>dg'=diffget,'<Leader>dp'=diffput,'<Leader>dj'=next,'<Leader>dk'=prev, 'q'=quit")
-    else
-        call append(2, "Usage:   <Enter>/'o'=open,'s'=sync,'q'=quit")
-    endif
-    call append(3, "Options: 'u'=update,'x'=set excludes,'i'=set ignore,'a'=set args, 'h'=hex mode, 'w'=wrap mode")
-    call append(4, "Diff Args:" . cmdarg)
-    call append(5, "")
-    " go to the beginning of the file
-    0
+" Applies every buffer-local option, keymap, syntax rule and cosmetic
+" tweak (theme/simple-map) the DirDiff result buffer needs, regardless
+" of whether the buffer was just built as an empty header-only skeleton
+" (fan-out streaming path, see s:DirDiffBuildSkeleton()) or fully
+" populated in one shot (synchronous / single-job async path, see
+" s:DirDiffFinalize()).  Must be called with the diff buffer as the
+" current buffer.  Idempotent; safe to call more than once.
+function! s:DirDiffApplyUIChrome() abort
     setlocal filetype=dirdiff
     setlocal nomodified
     setlocal nomodifiable
@@ -312,8 +433,473 @@ function! <SID>DirDiff(srcA, srcB)
     nnoremap <buffer> <2-Leftmouse> :call <SID>DirDiffOpen()<CR>
     call <SID>SetupSyntax()
 
+    " <SID>DirDiffExec() applies these two for every synchronous "!"
+    " invocation it runs; async jobs never go through it, so apply them
+    " once here instead, right as the buffer becomes visible.
+    if !empty(g:DirDiffTheme)
+        execute "colorscheme ". g:DirDiffTheme
+    endif
+    if g:DirDiffSimpleMap
+        nnoremap [ [c
+        nnoremap ] ]c
+    endif
+endfunction
+
+" Formats the trailing progress line shown at the bottom of the
+" fan-out streaming buffer (and of the classic "Diffing..." status
+" placeholder) while jobs are still in flight.
+function! s:DirDiffProgressText() abort
+    return "Diffing... " . s:DirDiffJobsDone . "/" . s:DirDiffJobsTotal . " lots termines"
+endfunction
+
+" Applies to a single line of raw "diff --brief"-style output exactly
+" the same [A]/[B] directory substitution, Windows path separator
+" fixup, and 4-space indent that s:DirDiffFinalize() applies in bulk to
+" the whole buffer for the synchronous/single-job paths.  Used by the
+" fan-out streaming path to make each freshly-arrived result line
+" presentable the instant it's inserted into the buffer.
+function! s:DirDiffTransformLine(line, dirA, dirB) abort
+    let result = a:line
+    " Substitute the longer path first, same reasoning as
+    " s:DirDiffFinalize(): otherwise a dir that happens to be a prefix
+    " of the other one could get mismatched.
+    if (strlen(a:dirA) > strlen(a:dirB))
+        let result = substitute(result, <SID>EscapeDirForRegex(a:dirA), '[A]', '')
+        let result = substitute(result, <SID>EscapeDirForRegex(a:dirB), '[B]', '')
+    else
+        let result = substitute(result, <SID>EscapeDirForRegex(a:dirB), '[B]', '')
+        let result = substitute(result, <SID>EscapeDirForRegex(a:dirA), '[A]', '')
+    endif
+    " In windows, diff behaves somewhat weirdly, for the appened path it'll
+    " use "/" instead of "\".  Convert this to \
+    if (has("win32"))
+        let result = substitute(result, '/', '\\', 'g')
+    endif
+    return '    ' . result
+endfunction
+
+" Takes the accumulated diff result lines -- whether they came from a
+" single synchronous/async diff run, or were assembled from several
+" fan-out sub-jobs -- and turns them into the final DirDiff buffer: writes
+" them to the result temp file, applies the [A]/[B] substitution, the
+" Windows path separator fixup, optional sorting, the header lines, the
+" buffer-local options/keymaps/syntax, and finally jumps to the first diff
+" entry.  Called from both the synchronous code path and the async
+" on_exit/completion callbacks (single-job / no-fan-out case only; the
+" fan-out streaming path never calls this -- see
+" s:DirDiffBuildSkeleton()/s:DirDiffFinishStreaming() instead).
+function! s:DirDiffFinalize(resultLines, dirDiffAbsSrcA, dirDiffAbsSrcB, cmdarg) abort
+    call writefile(a:resultLines, s:FilenameDiffWindow)
+    silent exe "edit ".s:FilenameDiffWindow
+    echo "Defining [A] and [B] ... "
+    " We then do a substitution on the directory path
+    " We need to do substitution of the the LONGER string first, otherwise
+    " it'll mix up the A and B directory
+    if (strlen(a:dirDiffAbsSrcA) > strlen(a:dirDiffAbsSrcB))
+	    silent! exe "%s/".<SID>EscapeDirForRegex(a:dirDiffAbsSrcA)."/[A]/"
+	    silent! exe "%s/".<SID>EscapeDirForRegex(a:dirDiffAbsSrcB)."/[B]/"
+    else
+	    silent! exe "%s/".<SID>EscapeDirForRegex(a:dirDiffAbsSrcB)."/[B]/"
+	    silent! exe "%s/".<SID>EscapeDirForRegex(a:dirDiffAbsSrcA)."/[A]/"
+    endif
+    " In windows, diff behaves somewhat weirdly, for the appened path it'll
+    " use "/" instead of "\".  Convert this to \
+    if (has("win32"))
+        silent! %s/\//\\/g
+    endif
+
+    echo "Sorting entries ..."
+    " We then sort the lines if the option is set
+    if (g:DirDiffSort == 1)
+        1,$call <SID>Sort("s:Strcmp")
+    endif
+
+    " Put in spacer in front of each line
+    silent! %s/^/    /
+
+    " We then put the file [A] and [B] on top of the diff lines
+    call append(0, "[A]=". a:dirDiffAbsSrcA)
+    call append(1, "[B]=". a:dirDiffAbsSrcB)
+    if get(g:, 'DirDiffEnableMappings', 0)
+        call append(2, "Usage:   <Enter>/'o'=open,'s'=sync,'<Leader>dg'=diffget,'<Leader>dp'=diffput,'<Leader>dj'=next,'<Leader>dk'=prev, 'q'=quit")
+    else
+        call append(2, "Usage:   <Enter>/'o'=open,'s'=sync,'q'=quit")
+    endif
+    call append(3, "Options: 'u'=update,'x'=set excludes,'i'=set ignore,'a'=set args, 'h'=hex mode, 'w'=wrap mode")
+    call append(4, "Diff Args:" . a:cmdarg)
+    call append(5, "")
+    " go to the beginning of the file
+    0
+    call s:DirDiffApplyUIChrome()
+
     " Open the first diff
     call <SID>DirDiffNext()
+endfunction
+
+" Builds the final DirDiff result buffer's full UI shell (headers,
+" options/keymaps, syntax, theme) immediately, before any fan-out diff
+" job has produced output.  Lines 1-6 (the [A]/[B] headers, Usage/
+" Options/Diff Args, and the blank separator) match exactly what
+" s:DirDiffFinalize() builds for the synchronous/single-job paths, so
+" every other function that hardcodes those line numbers (GetBaseDir,
+" DirDiffNext, HighlightLine...) keeps working unmodified.  A trailing
+" progress line is appended below the separator (line 7), kept up to
+" date and eventually removed by s:DirDiffStreamAppend()/
+" s:DirDiffFinishStreaming() as fan-out jobs complete.
+function! s:DirDiffBuildSkeleton(dirA, dirB, cmdarg) abort
+    call writefile([], s:FilenameDiffWindow)
+    silent exe "edit ".s:FilenameDiffWindow
+    let s:DirDiffStatusBufNr = bufnr('%')
+    setlocal modifiable
+
+    let headerLines = []
+    call add(headerLines, "[A]=". a:dirA)
+    call add(headerLines, "[B]=". a:dirB)
+    if get(g:, 'DirDiffEnableMappings', 0)
+        call add(headerLines, "Usage:   <Enter>/'o'=open,'s'=sync,'<Leader>dg'=diffget,'<Leader>dp'=diffput,'<Leader>dj'=next,'<Leader>dk'=prev, 'q'=quit")
+    else
+        call add(headerLines, "Usage:   <Enter>/'o'=open,'s'=sync,'q'=quit")
+    endif
+    call add(headerLines, "Options: 'u'=update,'x'=set excludes,'i'=set ignore,'a'=set args, 'h'=hex mode, 'w'=wrap mode")
+    call add(headerLines, "Diff Args:" . a:cmdarg)
+    call add(headerLines, "")
+
+    " :edit'ing a brand-new empty file leaves exactly one empty line;
+    " overwrite it with the first header line, then append the rest,
+    " plus the trailing progress line, below it.
+    call setline(1, headerLines[0])
+    call append(1, headerLines[1:])
+    call append(line('$'), s:DirDiffProgressText())
+
+    " go to the beginning of the file
+    0
+    call s:DirDiffApplyUIChrome()
+endfunction
+
+" Inserts newly-finished diff result lines (already transformed via
+" s:DirDiffTransformLine()) into the live fan-out streaming buffer,
+" right above the trailing progress line, and refreshes that progress
+" line's text.  This is what makes entries pop into the buffer as soon
+" as each fan-out job finishes, rather than only once every job is
+" done.  "lines" may be empty (eg. just to refresh the progress
+" counters); no insertion happens in that case.  Mirrors the setlocal
+" modifiable / nomodifiable toggle pattern already used by
+" <SID>HighlightLine()/<SID>DeHighlightLine() on this same buffer.
+function! s:DirDiffStreamAppend(lines) abort
+    if s:DirDiffStatusBufNr <= 0 || !bufexists(s:DirDiffStatusBufNr)
+        return
+    endif
+    let savedWin = win_getid()
+    call <SID>GotoDiffWindow()
+    setlocal modifiable
+    if !empty(a:lines)
+        " Insert right above the trailing progress line, so new
+        " entries land right after the last one already shown, in
+        " job-completion order -- no full re-sort/rebuild happens
+        " here, see s:DirDiffFinishStreaming() for the single sort
+        " pass done once every job is done.
+        call append(line('$') - 1, a:lines)
+    endif
+    call setline(line('$'), s:DirDiffProgressText())
+    setlocal nomodifiable
+    setlocal nomodified
+    call win_gotoid(savedWin)
+    redraw
+endfunction
+
+" Called once every fan-out job (and the immediate "only in" entries)
+" has been accounted for.  Removes the trailing progress line, sorts
+" the already-displayed result lines in place (no full buffer rebuild
+" -- just reordering the existing lines, same as the synchronous/
+" single-job path does via <SID>Sort()), and cleans up the buffer
+" entirely if it turns out there was nothing to show.
+function! s:DirDiffFinishStreaming() abort
+    if s:DirDiffStatusBufNr <= 0 || !bufexists(s:DirDiffStatusBufNr)
+        return
+    endif
+    let bufNr = s:DirDiffStatusBufNr
+    let savedWin = win_getid()
+    call <SID>GotoDiffWindow()
+
+    " A line the user already opened while jobs were still streaming in
+    " may still carry the "==> " highlight marker; strip it before the
+    " final sort below, since that marker would otherwise skew the
+    " alphabetical ordering of otherwise-identical entries (a bare "="
+    " does not collate the same way as the normal 4-space indent).
+    if exists('b:currentDiff')
+        call <SID>DeHighlightLine()
+    endif
+
+    setlocal modifiable
+    " The trailing progress line has done its job; every job is done.
+    $delete _
+    setlocal nomodifiable
+    setlocal nomodified
+
+    if line('$') <= s:DirDiffFirstDiffLine
+        " Nothing was ever streamed in (no "only in" entries, every
+        " common entry diffed identical): behave like the synchronous
+        " path and don't leave a stray, empty result buffer behind.
+        call win_gotoid(savedWin)
+        silent! execute "bwipeout! " . bufNr
+        let s:DirDiffStatusBufNr = -1
+        redraw | echom "diff found no differences - directories match."
+        return
+    endif
+
+    if (g:DirDiffSort == 1)
+        setlocal modifiable
+        exe (s:DirDiffFirstDiffLine + 1) . ",$call <SID>Sort(\"s:Strcmp\")"
+        setlocal nomodifiable
+        setlocal nomodified
+    endif
+
+    " <SID>Sort() leaves the cursor sitting on the first line of the
+    " range it just sorted (line 7 here), not back at the very top of
+    " the buffer; s:DirDiffFinalize() resets the cursor to the
+    " beginning the same way, right before its own call to
+    " <SID>DirDiffNext(), so that DirDiffNext()'s "are we still inside
+    " the header?" check (line(".") < s:DirDiffFirstDiffLine) behaves
+    " the same regardless of where the sort left the cursor.
+    0
+
+    call win_gotoid(savedWin)
+
+    " Open the first diff now that every entry is in and sorted, same
+    " as s:DirDiffFinalize() does for the synchronous/single-job paths
+    " -- never before the sort, and only once per run.
+    call <SID>DirDiffNext()
+    redraw
+endfunction
+
+" Opens an immediate scratch buffer showing diffing progress while the
+" async jobs are still running.  s:DirDiffFinalize() later :edit's over it
+" with the real result file once everything's done.
+function! s:DirDiffOpenStatusBuffer() abort
+    enew
+    let s:DirDiffStatusBufNr = bufnr('%')
+    setlocal buftype=nofile
+    setlocal bufhidden=wipe
+    setlocal noswapfile
+    setlocal nowrap
+    call setline(1, "Diffing...")
+    setlocal nomodified
+endfunction
+
+" Refreshes the "Diffing..." progress line in the scratch status buffer.
+" Does NOT redraw by itself; callers are expected to issue a single
+" redraw after updating, to avoid flooding the UI with redraws.
+function! s:DirDiffUpdateStatusLine() abort
+    if s:DirDiffStatusBufNr <= 0 || !bufexists(s:DirDiffStatusBufNr)
+        return
+    endif
+    call setbufline(s:DirDiffStatusBufNr, 1, s:DirDiffProgressText())
+endfunction
+
+" Adds a unit of work (a complete "diff ..." shell command comparing two
+" paths, without any output redirection yet) to the pending job queue.
+" "desc" is only used for progress/error reporting.
+function! s:DirDiffQueueJob(cmd, desc, generation) abort
+    call add(s:DirDiffJobQueue, {'cmd': a:cmd, 'desc': a:desc, 'generation': a:generation})
+endfunction
+
+" Starts as many queued jobs as allowed by g:DirDiffMaxJobs (clamped into
+" s:DirDiffJobMaxJobs).  Safe to call repeatedly; it simply no-ops once
+" the concurrency limit is reached or the queue is empty.  Also the
+" single place that detects "everything is done" and triggers
+" s:DirDiffFinalize().
+function! s:DirDiffPumpQueue(generation) abort
+    if a:generation != s:DirDiffGeneration
+        return
+    endif
+    while len(s:DirDiffActiveJobs) < s:DirDiffJobMaxJobs && !empty(s:DirDiffJobQueue)
+        let work = remove(s:DirDiffJobQueue, 0)
+        let outFile = tempname()
+        let cmd = work.cmd . " > \"" . outFile . "\""
+        let OnExit = function('s:DirDiffOnJobExit', [a:generation, outFile, work.desc])
+        let jobId = s:JobStart(cmd, {'on_exit': OnExit})
+        if jobId > 0
+            call add(s:DirDiffActiveJobs, jobId)
+            if g:DirDiffJobTimeout > 0
+                call timer_start(g:DirDiffJobTimeout, {-> s:JobStop(jobId)})
+            endif
+        else
+            " Could not even start the job; treat it as an immediate
+            " error so the overall run doesn't hang forever.
+            call add(s:DirDiffResultLines, "[ERREUR] comparaison impossible : " . work.desc . " (demarrage du job echoue)")
+            let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
+            call s:DirDiffUpdateStatusLine()
+        endif
+    endwhile
+    call s:DirDiffMaybeFinish(a:generation)
+endfunction
+
+" Common on_exit handler for every diff job, whether it's the single
+" async job or part of a fan-out batch.  Bound via function(name,
+" arglist) with (generation, outFile, desc) pre-filled; NeoVim appends
+" (job_id, data, event) when invoking the callback, where "data" is the
+" process exit code.
+function! s:DirDiffOnJobExit(generation, outFile, desc, job_id, data, event) abort
+    " Ignore callbacks from a run that's since been superseded (eg. the
+    " user pressed 'u' to update, or started a brand new :DirDiff before
+    " this one finished).
+    if a:generation != s:DirDiffGeneration
+        silent! call delete(a:outFile)
+        return
+    endif
+
+    call filter(s:DirDiffActiveJobs, 'v:val != a:job_id')
+
+    let lines = filereadable(a:outFile) ? readfile(a:outFile) : []
+    silent! call delete(a:outFile)
+
+    " GNU diff: 0 = identical, 1 = differences found, >=2 = a real error
+    " (eg. permission denied, path not found).  Surface errors instead of
+    " silently swallowing them.
+    if a:data != 0 && a:data != 1
+        call add(lines, "[ERREUR] comparaison impossible : " . a:desc . " (code " . a:data . ")")
+    endif
+
+    let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
+
+    if s:DirDiffStreaming
+        " Fan-out: show this job's lines right away, already formatted
+        " exactly like the final buffer expects them, instead of
+        " waiting for every other job to finish too.
+        let transformed = map(copy(lines), 's:DirDiffTransformLine(v:val, s:DirDiffJobDirA, s:DirDiffJobDirB)')
+        call s:DirDiffStreamAppend(transformed)
+    else
+        call extend(s:DirDiffResultLines, lines)
+        call s:DirDiffUpdateStatusLine()
+        redraw
+    endif
+
+    call s:DirDiffPumpQueue(a:generation)
+endfunction
+
+" Called whenever a unit of work finishes (successfully or not) to check
+" whether the whole run is complete, and if so builds the final buffer
+" (single-job / no-fan-out path) or finalizes the already-streamed
+" buffer (fan-out path, see s:DirDiffFinishStreaming()).
+function! s:DirDiffMaybeFinish(generation) abort
+    if a:generation != s:DirDiffGeneration
+        return
+    endif
+    if s:DirDiffJobsDone < s:DirDiffJobsTotal || !empty(s:DirDiffJobQueue) || !empty(s:DirDiffActiveJobs)
+        return
+    endif
+
+    if s:DirDiffStreaming
+        call s:DirDiffFinishStreaming()
+        return
+    endif
+
+    if empty(s:DirDiffResultLines)
+        " No differences: the original synchronous path never touched the
+        " current buffer/window in this case, it just echoed a message.
+        " Clean up the "Diffing..." scratch buffer we opened up front so
+        " the user isn't left staring at a stale, empty progress buffer.
+        if s:DirDiffStatusBufNr > 0 && bufexists(s:DirDiffStatusBufNr)
+            silent! execute "bwipeout! " . s:DirDiffStatusBufNr
+        endif
+        let s:DirDiffStatusBufNr = -1
+        redraw | echom "diff found no differences - directories match."
+        return
+    endif
+    call s:DirDiffFinalize(s:DirDiffResultLines, s:DirDiffJobDirA, s:DirDiffJobDirB, s:DirDiffJobCmdArg)
+endfunction
+
+" Fans the comparison out across the top-level entries of the two
+" directories: entries present on both sides and that are directories on
+" both sides, as well as entries present on both sides that are files,
+" each become one queued diff job (further recursion into subdirectories
+" happens inside that sub-diff thanks to "-r").  Entries that only exist
+" on one side are resolved immediately, without spawning anything, by
+" synthesizing the same "Only in ..." line that "diff --brief" itself
+" would have produced.
+function! s:DirDiffDispatchFanOut(dirA, dirB, cmdarg, generation) abort
+    let entriesA = readdir(a:dirA)
+    let entriesB = readdir(a:dirB)
+
+    let setA = {}
+    for name in entriesA
+        let setA[name] = 1
+    endfor
+    let setB = {}
+    for name in entriesB
+        let setB[name] = 1
+    endfor
+
+    let onlyA = filter(copy(entriesA), '!has_key(setB, v:val)')
+    let onlyB = filter(copy(entriesB), '!has_key(setA, v:val)')
+    let common = filter(copy(entriesA), 'has_key(setB, v:val)')
+
+    let commonDirs = []
+    let commonFiles = []
+    for name in common
+        if isdirectory(a:dirA . s:sep . name) && isdirectory(a:dirB . s:sep . name)
+            call add(commonDirs, name)
+        else
+            call add(commonFiles, name)
+        endif
+    endfor
+
+    " Entries that only exist on one side don't need a diff job: we
+    " already have everything required to synthesize the exact "Only in
+    " ..." line diff --brief itself would output for a root-level
+    " entry.  Collect them now; they're shown right away, below, before
+    " any job has even started.
+    let onlyLines = []
+    for name in onlyA
+        call add(onlyLines, s:DirDiffDiffOnlyLine . a:dirA . s:DirDiffDiffOnlyLineCenter . name)
+    endfor
+    for name in onlyB
+        call add(onlyLines, s:DirDiffDiffOnlyLine . a:dirB . s:DirDiffDiffOnlyLineCenter . name)
+    endfor
+
+    " Each common directory gets its own job ("-r" in cmdarg makes diff
+    " recurse into it).  Common files are also queued one job per entry,
+    " rather than batched into a single shell invocation chaining several
+    " "diff" calls: cmd.exe, PowerShell and POSIX shells don't agree on an
+    " unconditional command separator, and "&&" would wrongly stop a
+    " batch early anyway on GNU diff's "exit code 1 = differences found".
+    " One job per entry is the simplest option that's correct on every
+    " platform; concurrency is still bounded by g:DirDiffMaxJobs.
+    for name in commonDirs + commonFiles
+        let pathA = a:dirA . s:sep . name
+        let pathB = a:dirB . s:sep . name
+        let cmd = g:DirDiffLangString . "diff" . a:cmdarg . " \"" . pathA . "\" \"" . pathB . "\""
+        call s:DirDiffQueueJob(cmd, pathA, a:generation)
+    endfor
+
+    let s:DirDiffJobsTotal = len(s:DirDiffJobQueue)
+    let s:DirDiffJobsDone = 0
+
+    " Show the "only in" entries right away -- they don't need a job --
+    " now that the progress counters reflect the real total, and
+    " refresh the progress line even when there happen to be none.
+    if !empty(onlyLines)
+        let transformed = map(onlyLines, 's:DirDiffTransformLine(v:val, a:dirA, a:dirB)')
+        call s:DirDiffStreamAppend(transformed)
+    else
+        call s:DirDiffStreamAppend([])
+    endif
+
+    if empty(s:DirDiffJobQueue)
+        call s:DirDiffMaybeFinish(a:generation)
+    else
+        call s:DirDiffPumpQueue(a:generation)
+    endif
+endfunction
+
+" Stops every in-flight async job and clears the pending queue.  Safe to
+" call even when no job is running (eg. under classic Vim).
+function! s:DirDiffStopActiveJobs() abort
+    for jobId in s:DirDiffActiveJobs
+        call s:JobStop(jobId)
+    endfor
+    let s:DirDiffActiveJobs = []
+    let s:DirDiffJobQueue = []
 endfunction
 
 " Set up syntax highlighing for the diff window
@@ -341,6 +927,7 @@ endfunction
 
 " You should call this within the diff window
 function! <SID>DirDiffUpdate()
+    call s:DirDiffStopActiveJobs()
     let dirA = <SID>GetBaseDir("A")
     let dirB = <SID>GetBaseDir("B")
     call <SID>DirDiff(dirA, dirB)
@@ -350,6 +937,8 @@ endfun
 function! <SID>DirDiffQuit()
     let in = confirm ("Are you sure you want to quit DirDiff?", "&Yes\n&No", 2)
     if (in == 1)
+        call s:DirDiffStopActiveJobs()
+        let s:DirDiffGeneration = s:DirDiffGeneration + 1
         call <SID>SaveDiffWindowsIfModified()
         bd!
     endif
