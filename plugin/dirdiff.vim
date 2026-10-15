@@ -168,31 +168,24 @@ let s:DirDiffGeneration = 0
 let s:DirDiffActiveJobs = []
 " Pending work items, each a {'cmd', 'desc', 'generation'} dict.
 let s:DirDiffJobQueue = []
-" Diff output lines accumulated across one or several jobs.
-let s:DirDiffResultLines = []
 " Progress counters, also used to know when every job is done.
 let s:DirDiffJobsTotal = 0
 let s:DirDiffJobsDone = 0
-" Context shared by the queue pump and the on_exit callback; set once per
+" Context shared by the queue pump and the job callbacks; set once per
 " DirDiff() invocation, before any job is started.
 let s:DirDiffJobMaxJobs = 1
 let s:DirDiffJobDirA = ""
 let s:DirDiffJobDirB = ""
 let s:DirDiffJobCmdArg = ""
-" Buffer number of the live result buffer shown while async jobs are
-" still running: either the minimal "Diffing..." scratch placeholder
-" (classic/single-job path, see s:DirDiffOpenStatusBuffer()), or the
-" fully-chromed fan-out skeleton that gets streamed into progressively
-" (see s:DirDiffBuildSkeleton()).  -1 when none is active.
+" Buffer number of the live result buffer, built up front by
+" s:DirDiffBuildSkeleton() and streamed into progressively by
+" s:DirDiffStreamAppend() as job output arrives -- the one and only
+" buffer used by the whole async path, whether it ends up running a
+" single diff job (g:DirDiffMaxJobs <= 1, no fan-out) or several
+" concurrent ones (fan-out).  g:DirDiffMaxJobs only controls
+" parallelism; streaming always applies the same way regardless.  -1
+" when none is active.
 let s:DirDiffStatusBufNr = -1
-" Whether the current async run streams result lines into the buffer
-" progressively as each fan-out job finishes (1), as opposed to
-" replacing the whole buffer at once when the single result becomes
-" available (0: classic synchronous path, or a single async job with
-" no fan-out -- there's nothing to stream there, only one batch of
-" results ever arrives).  Only meaningful while an async run is in
-" flight.
-let s:DirDiffStreaming = 0
 " Minimal seam around jobstart()/jobstop() so the rest of the plugin
 " doesn't need to sprinkle has('nvim') checks everywhere.  Returns -1
 " when async execution isn't available/enabled, the same way callers
@@ -335,7 +328,6 @@ function! <SID>DirDiff(srcA, srcB)
     endif
 
     " ---- Asynchronous path (NeoVim only) ----
-    let s:DirDiffResultLines = []
     let s:DirDiffJobQueue = []
     let s:DirDiffActiveJobs = []
     let s:DirDiffJobsTotal = 0
@@ -345,26 +337,30 @@ function! <SID>DirDiff(srcA, srcB)
     let s:DirDiffJobCmdArg = cmdarg
     let s:DirDiffJobMaxJobs = max([1, min([64, g:DirDiffMaxJobs])])
 
+    " Every async run -- whether it ends up running a single diff job
+    " or fans out across several -- builds the final buffer's full UI
+    " shell immediately and streams result lines into it as job output
+    " arrives (see s:DirDiffBuildSkeleton()/s:DirDiffStreamAppend()
+    " below, and s:DirDiffPumpQueue()'s on_stdout handling).
+    " g:DirDiffMaxJobs only controls how many diff processes may run
+    " concurrently; it never affects how promptly results show up.
+    call s:DirDiffBuildSkeleton(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg)
+
     if (s:DirDiffJobMaxJobs <= 1)
-        " Single job, equivalent to the synchronous command above, just
-        " non-blocking.  There's only ever one batch of results arriving
-        " at once here, so the minimal "Diffing..." placeholder buffer
-        " swapped out wholesale by s:DirDiffFinalize() once the job
-        " completes is perfectly adequate; there is nothing to stream
-        " progressively.
-        let s:DirDiffStreaming = 0
-        call s:DirDiffOpenStatusBuffer()
+        " No fan-out: a single job runs the whole comparison (still
+        " "-r" recursive over the entire tree being compared), just
+        " non-blocking, with its stdout streamed into the skeleton
+        " line-by-line exactly like a fan-out sub-job's output would
+        " be.
         let cmd = g:DirDiffLangString . "diff" . cmdarg . " \"".DirDiffAbsSrcA."\" \"".DirDiffAbsSrcB."\""
         call s:DirDiffQueueJob(cmd, DirDiffAbsSrcA." <-> ".DirDiffAbsSrcB, myGeneration)
         let s:DirDiffJobsTotal = 1
         call s:DirDiffPumpQueue(myGeneration)
     else
-        " Fan-out: several jobs finish at different times, so build the
-        " final buffer's full UI shell immediately and stream each
-        " job's result lines into it as it completes (see
-        " s:DirDiffBuildSkeleton()/s:DirDiffStreamAppend() below).
-        let s:DirDiffStreaming = 1
-        call s:DirDiffBuildSkeleton(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg)
+        " Fan-out: partition the comparison across the top-level
+        " entries of both directories so several diff jobs can run
+        " concurrently; "only in" entries are shown immediately, and
+        " each sub-job's own output streams in the same way as above.
         call s:DirDiffDispatchFanOut(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg, myGeneration)
     endif
 endfunction
@@ -399,8 +395,8 @@ endfunction
 " Applies every buffer-local option, keymap, syntax rule and cosmetic
 " tweak (theme/simple-map) the DirDiff result buffer needs, regardless
 " of whether the buffer was just built as an empty header-only skeleton
-" (fan-out streaming path, see s:DirDiffBuildSkeleton()) or fully
-" populated in one shot (synchronous / single-job async path, see
+" (the async streaming path, see s:DirDiffBuildSkeleton()) or fully
+" populated in one shot (the classic synchronous path, see
 " s:DirDiffFinalize()).  Must be called with the diff buffer as the
 " current buffer.  Idempotent; safe to call more than once.
 function! s:DirDiffApplyUIChrome() abort
@@ -445,9 +441,8 @@ function! s:DirDiffApplyUIChrome() abort
     endif
 endfunction
 
-" Formats the trailing progress line shown at the bottom of the
-" fan-out streaming buffer (and of the classic "Diffing..." status
-" placeholder) while jobs are still in flight.
+" Formats the trailing progress line shown at the bottom of the live
+" async streaming buffer while jobs are still in flight.
 function! s:DirDiffProgressText() abort
     return "Diffing... " . s:DirDiffJobsDone . "/" . s:DirDiffJobsTotal . " lots termines"
 endfunction
@@ -455,9 +450,9 @@ endfunction
 " Applies to a single line of raw "diff --brief"-style output exactly
 " the same [A]/[B] directory substitution, Windows path separator
 " fixup, and 4-space indent that s:DirDiffFinalize() applies in bulk to
-" the whole buffer for the synchronous/single-job paths.  Used by the
-" fan-out streaming path to make each freshly-arrived result line
-" presentable the instant it's inserted into the buffer.
+" the whole buffer for the classic synchronous path.  Used by the async
+" streaming path to make each freshly-arrived result line presentable
+" the instant it's inserted into the buffer.
 function! s:DirDiffTransformLine(line, dirA, dirB) abort
     let result = a:line
     " Substitute the longer path first, same reasoning as
@@ -478,16 +473,16 @@ function! s:DirDiffTransformLine(line, dirA, dirB) abort
     return '    ' . result
 endfunction
 
-" Takes the accumulated diff result lines -- whether they came from a
-" single synchronous/async diff run, or were assembled from several
-" fan-out sub-jobs -- and turns them into the final DirDiff buffer: writes
-" them to the result temp file, applies the [A]/[B] substitution, the
-" Windows path separator fixup, optional sorting, the header lines, the
-" buffer-local options/keymaps/syntax, and finally jumps to the first diff
-" entry.  Called from both the synchronous code path and the async
-" on_exit/completion callbacks (single-job / no-fan-out case only; the
-" fan-out streaming path never calls this -- see
-" s:DirDiffBuildSkeleton()/s:DirDiffFinishStreaming() instead).
+" Takes the accumulated diff result lines from a single synchronous
+" diff run and turns them into the final DirDiff buffer: writes them to
+" the result temp file, applies the [A]/[B] substitution, the Windows
+" path separator fixup, optional sorting, the header lines, the
+" buffer-local options/keymaps/syntax, and finally jumps to the first
+" diff entry.  Only ever called from the classic, fully-synchronous
+" code path (g:DirDiffAsync disabled, or classic Vim without a usable
+" job API); the async path -- whether it ends up running a single job
+" or fans out across several -- always streams progressively instead,
+" see s:DirDiffBuildSkeleton()/s:DirDiffFinishStreaming().
 function! s:DirDiffFinalize(resultLines, dirDiffAbsSrcA, dirDiffAbsSrcB, cmdarg) abort
     call writefile(a:resultLines, s:FilenameDiffWindow)
     silent exe "edit ".s:FilenameDiffWindow
@@ -537,15 +532,15 @@ function! s:DirDiffFinalize(resultLines, dirDiffAbsSrcA, dirDiffAbsSrcB, cmdarg)
 endfunction
 
 " Builds the final DirDiff result buffer's full UI shell (headers,
-" options/keymaps, syntax, theme) immediately, before any fan-out diff
-" job has produced output.  Lines 1-6 (the [A]/[B] headers, Usage/
-" Options/Diff Args, and the blank separator) match exactly what
-" s:DirDiffFinalize() builds for the synchronous/single-job paths, so
-" every other function that hardcodes those line numbers (GetBaseDir,
-" DirDiffNext, HighlightLine...) keeps working unmodified.  A trailing
-" progress line is appended below the separator (line 7), kept up to
-" date and eventually removed by s:DirDiffStreamAppend()/
-" s:DirDiffFinishStreaming() as fan-out jobs complete.
+" options/keymaps, syntax, theme) immediately, before any async diff
+" job -- single or fanned out -- has produced output.  Lines 1-6 (the
+" [A]/[B] headers, Usage/Options/Diff Args, and the blank separator)
+" match exactly what s:DirDiffFinalize() builds for the classic
+" synchronous path, so every other function that hardcodes those line
+" numbers (GetBaseDir, DirDiffNext, HighlightLine...) keeps working
+" unmodified.  A trailing progress line is appended below the
+" separator (line 7), kept up to date and eventually removed by
+" s:DirDiffStreamAppend()/s:DirDiffFinishStreaming() as jobs complete.
 function! s:DirDiffBuildSkeleton(dirA, dirB, cmdarg) abort
     call writefile([], s:FilenameDiffWindow)
     silent exe "edit ".s:FilenameDiffWindow
@@ -576,14 +571,16 @@ function! s:DirDiffBuildSkeleton(dirA, dirB, cmdarg) abort
     call s:DirDiffApplyUIChrome()
 endfunction
 
-" Inserts newly-finished diff result lines (already transformed via
-" s:DirDiffTransformLine()) into the live fan-out streaming buffer,
+" Inserts newly-arrived diff result lines (already transformed via
+" s:DirDiffTransformLine()) into the live async streaming buffer,
 " right above the trailing progress line, and refreshes that progress
 " line's text.  This is what makes entries pop into the buffer as soon
-" as each fan-out job finishes, rather than only once every job is
-" done.  "lines" may be empty (eg. just to refresh the progress
-" counters); no insertion happens in that case.  Mirrors the setlocal
-" modifiable / nomodifiable toggle pattern already used by
+" as output arrives on a job's stdout (or as soon as a job finishes),
+" rather than only once every job is done -- regardless of whether
+" there's a single job running or several fanned out concurrently.
+" "lines" may be empty (eg. just to refresh the progress counters); no
+" insertion happens in that case.  Mirrors the setlocal modifiable /
+" nomodifiable toggle pattern already used by
 " <SID>HighlightLine()/<SID>DeHighlightLine() on this same buffer.
 function! s:DirDiffStreamAppend(lines) abort
     if s:DirDiffStatusBufNr <= 0 || !bufexists(s:DirDiffStatusBufNr)
@@ -595,9 +592,9 @@ function! s:DirDiffStreamAppend(lines) abort
     if !empty(a:lines)
         " Insert right above the trailing progress line, so new
         " entries land right after the last one already shown, in
-        " job-completion order -- no full re-sort/rebuild happens
-        " here, see s:DirDiffFinishStreaming() for the single sort
-        " pass done once every job is done.
+        " arrival order -- no full re-sort/rebuild happens here, see
+        " s:DirDiffFinishStreaming() for the single sort pass done
+        " once every job is done.
         call append(line('$') - 1, a:lines)
     endif
     call setline(line('$'), s:DirDiffProgressText())
@@ -607,12 +604,12 @@ function! s:DirDiffStreamAppend(lines) abort
     redraw
 endfunction
 
-" Called once every fan-out job (and the immediate "only in" entries)
-" has been accounted for.  Removes the trailing progress line, sorts
-" the already-displayed result lines in place (no full buffer rebuild
-" -- just reordering the existing lines, same as the synchronous/
-" single-job path does via <SID>Sort()), and cleans up the buffer
-" entirely if it turns out there was nothing to show.
+" Called once every queued job (and the immediate "only in" entries,
+" for the fan-out case) has been accounted for.  Removes the trailing
+" progress line, sorts the already-displayed result lines in place (no
+" full buffer rebuild -- just reordering the existing lines, same as
+" the classic synchronous path does via <SID>Sort()), and cleans up the
+" buffer entirely if it turns out there was nothing to show.
 function! s:DirDiffFinishStreaming() abort
     if s:DirDiffStatusBufNr <= 0 || !bufexists(s:DirDiffStatusBufNr)
         return
@@ -666,39 +663,15 @@ function! s:DirDiffFinishStreaming() abort
     call win_gotoid(savedWin)
 
     " Open the first diff now that every entry is in and sorted, same
-    " as s:DirDiffFinalize() does for the synchronous/single-job paths
-    " -- never before the sort, and only once per run.
+    " as s:DirDiffFinalize() does for the classic synchronous path --
+    " never before the sort, and only once per run.
     call <SID>DirDiffNext()
     redraw
 endfunction
 
-" Opens an immediate scratch buffer showing diffing progress while the
-" async jobs are still running.  s:DirDiffFinalize() later :edit's over it
-" with the real result file once everything's done.
-function! s:DirDiffOpenStatusBuffer() abort
-    enew
-    let s:DirDiffStatusBufNr = bufnr('%')
-    setlocal buftype=nofile
-    setlocal bufhidden=wipe
-    setlocal noswapfile
-    setlocal nowrap
-    call setline(1, "Diffing...")
-    setlocal nomodified
-endfunction
-
-" Refreshes the "Diffing..." progress line in the scratch status buffer.
-" Does NOT redraw by itself; callers are expected to issue a single
-" redraw after updating, to avoid flooding the UI with redraws.
-function! s:DirDiffUpdateStatusLine() abort
-    if s:DirDiffStatusBufNr <= 0 || !bufexists(s:DirDiffStatusBufNr)
-        return
-    endif
-    call setbufline(s:DirDiffStatusBufNr, 1, s:DirDiffProgressText())
-endfunction
-
 " Adds a unit of work (a complete "diff ..." shell command comparing two
-" paths, without any output redirection yet) to the pending job queue.
-" "desc" is only used for progress/error reporting.
+" paths) to the pending job queue.  "desc" is only used for
+" progress/error reporting.
 function! s:DirDiffQueueJob(cmd, desc, generation) abort
     call add(s:DirDiffJobQueue, {'cmd': a:cmd, 'desc': a:desc, 'generation': a:generation})
 endfunction
@@ -707,17 +680,32 @@ endfunction
 " s:DirDiffJobMaxJobs).  Safe to call repeatedly; it simply no-ops once
 " the concurrency limit is reached or the queue is empty.  Also the
 " single place that detects "everything is done" and triggers
-" s:DirDiffFinalize().
+" s:DirDiffMaybeFinish().
+"
+" Each started job's stdout streams directly into the result buffer
+" line-by-line as it arrives (s:DirDiffOnJobStdout()), rather than
+" being redirected to a file and read back only once the process exits:
+" this is what makes a single job (g:DirDiffMaxJobs <= 1, no fan-out)
+" just as progressively responsive as a fan-out batch, since "diff
+" --brief" itself produces its "Only in ..."/"Files ... differ" lines
+" continuously as it walks the tree, long before the process exits.
 function! s:DirDiffPumpQueue(generation) abort
     if a:generation != s:DirDiffGeneration
         return
     endif
     while len(s:DirDiffActiveJobs) < s:DirDiffJobMaxJobs && !empty(s:DirDiffJobQueue)
         let work = remove(s:DirDiffJobQueue, 0)
-        let outFile = tempname()
-        let cmd = work.cmd . " > \"" . outFile . "\""
-        let OnExit = function('s:DirDiffOnJobExit', [a:generation, outFile, work.desc])
-        let jobId = s:JobStart(cmd, {'on_exit': OnExit})
+        " One-element List holding this job's not-yet-newline-terminated
+        " stdout remainder; mutated in place by s:DirDiffOnJobStdout()
+        " and flushed as a final line by s:DirDiffOnJobExit() once the
+        " job ends.  Vimscript Lists are passed by reference into
+        " function(name, arglist)-bound closures, so both callbacks
+        " below share this same mutable one-element cell despite being
+        " two separate function values.
+        let pending = ['']
+        let OnStdout = function('s:DirDiffOnJobStdout', [a:generation, pending])
+        let OnExit = function('s:DirDiffOnJobExit', [a:generation, pending, work.desc])
+        let jobId = s:JobStart(work.cmd, {'on_stdout': OnStdout, 'on_exit': OnExit})
         if jobId > 0
             call add(s:DirDiffActiveJobs, jobId)
             if g:DirDiffJobTimeout > 0
@@ -726,32 +714,70 @@ function! s:DirDiffPumpQueue(generation) abort
         else
             " Could not even start the job; treat it as an immediate
             " error so the overall run doesn't hang forever.
-            call add(s:DirDiffResultLines, "[ERREUR] comparaison impossible : " . work.desc . " (demarrage du job echoue)")
             let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
-            call s:DirDiffUpdateStatusLine()
+            let errLine = s:DirDiffTransformLine("[ERREUR] comparaison impossible : " . work.desc . " (demarrage du job echoue)", s:DirDiffJobDirA, s:DirDiffJobDirB)
+            call s:DirDiffStreamAppend([errLine])
         endif
     endwhile
     call s:DirDiffMaybeFinish(a:generation)
 endfunction
 
+" on_stdout callback for every diff job, whether it's the single async
+" job (no fan-out) or part of a fan-out batch.  Bound via function(name,
+" arglist) with (generation, pending) pre-filled; NeoVim appends
+" (job_id, data, event) when invoking the callback.
+"
+" "data" is a List of strings that may span several on_stdout calls:
+" every element except the last is guaranteed to be a complete line,
+" while the last element is either a partial line still awaiting its
+" trailing newline, or an empty string when the previous chunk happened
+" to end exactly on a newline.  "pending" (shared with this same job's
+" on_exit callback, see s:DirDiffPumpQueue()) holds the not-yet-complete
+" remainder left over from the previous call: it's prefixed onto this
+" call's first element, every element but the last is transformed and
+" streamed into the buffer right away, and the new last element becomes
+" the updated pending remainder for next time.
+function! s:DirDiffOnJobStdout(generation, pending, job_id, data, event) abort
+    if a:generation != s:DirDiffGeneration
+        return
+    endif
+    if empty(a:data)
+        return
+    endif
+    let chunk = copy(a:data)
+    let chunk[0] = a:pending[0] . chunk[0]
+    let a:pending[0] = remove(chunk, -1)
+    if !empty(chunk)
+        let transformed = map(chunk, 's:DirDiffTransformLine(v:val, s:DirDiffJobDirA, s:DirDiffJobDirB)')
+        call s:DirDiffStreamAppend(transformed)
+    endif
+endfunction
+
 " Common on_exit handler for every diff job, whether it's the single
-" async job or part of a fan-out batch.  Bound via function(name,
-" arglist) with (generation, outFile, desc) pre-filled; NeoVim appends
-" (job_id, data, event) when invoking the callback, where "data" is the
-" process exit code.
-function! s:DirDiffOnJobExit(generation, outFile, desc, job_id, data, event) abort
+" async job (no fan-out) or part of a fan-out batch.  Bound via
+" function(name, arglist) with (generation, pending, desc) pre-filled,
+" sharing the same "pending" remainder List as this job's on_stdout
+" callback (see s:DirDiffPumpQueue()); NeoVim appends (job_id, data,
+" event) when invoking the callback, where "data" is the process exit
+" code.
+function! s:DirDiffOnJobExit(generation, pending, desc, job_id, data, event) abort
     " Ignore callbacks from a run that's since been superseded (eg. the
     " user pressed 'u' to update, or started a brand new :DirDiff before
     " this one finished).
     if a:generation != s:DirDiffGeneration
-        silent! call delete(a:outFile)
         return
     endif
 
     call filter(s:DirDiffActiveJobs, 'v:val != a:job_id')
 
-    let lines = filereadable(a:outFile) ? readfile(a:outFile) : []
-    silent! call delete(a:outFile)
+    let lines = []
+    " Flush whatever's left in "pending": if the process's very last
+    " write wasn't newline-terminated, on_stdout had no way to know it
+    " was the last line until now -- it's still a complete, valid line.
+    if !empty(a:pending[0])
+        call add(lines, a:pending[0])
+        let a:pending[0] = ''
+    endif
 
     " GNU diff: 0 = identical, 1 = differences found, >=2 = a real error
     " (eg. permission denied, path not found).  Surface errors instead of
@@ -762,25 +788,21 @@ function! s:DirDiffOnJobExit(generation, outFile, desc, job_id, data, event) abo
 
     let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
 
-    if s:DirDiffStreaming
-        " Fan-out: show this job's lines right away, already formatted
-        " exactly like the final buffer expects them, instead of
-        " waiting for every other job to finish too.
-        let transformed = map(copy(lines), 's:DirDiffTransformLine(v:val, s:DirDiffJobDirA, s:DirDiffJobDirB)')
-        call s:DirDiffStreamAppend(transformed)
-    else
-        call extend(s:DirDiffResultLines, lines)
-        call s:DirDiffUpdateStatusLine()
-        redraw
-    endif
+    " Show this job's trailing/flushed lines right away, already
+    " formatted exactly like the buffer expects them, instead of
+    " waiting for every other job to finish too.  Called even when
+    " "lines" is empty, just to refresh the progress counters.
+    let transformed = map(lines, 's:DirDiffTransformLine(v:val, s:DirDiffJobDirA, s:DirDiffJobDirB)')
+    call s:DirDiffStreamAppend(transformed)
 
     call s:DirDiffPumpQueue(a:generation)
 endfunction
 
 " Called whenever a unit of work finishes (successfully or not) to check
-" whether the whole run is complete, and if so builds the final buffer
-" (single-job / no-fan-out path) or finalizes the already-streamed
-" buffer (fan-out path, see s:DirDiffFinishStreaming()).
+" whether the whole async run is complete, and if so finalizes the
+" already-streamed result buffer (see s:DirDiffFinishStreaming()).  The
+" classic, fully-synchronous path never calls this -- it builds its
+" result buffer directly via s:DirDiffFinalize() instead.
 function! s:DirDiffMaybeFinish(generation) abort
     if a:generation != s:DirDiffGeneration
         return
@@ -788,25 +810,7 @@ function! s:DirDiffMaybeFinish(generation) abort
     if s:DirDiffJobsDone < s:DirDiffJobsTotal || !empty(s:DirDiffJobQueue) || !empty(s:DirDiffActiveJobs)
         return
     endif
-
-    if s:DirDiffStreaming
-        call s:DirDiffFinishStreaming()
-        return
-    endif
-
-    if empty(s:DirDiffResultLines)
-        " No differences: the original synchronous path never touched the
-        " current buffer/window in this case, it just echoed a message.
-        " Clean up the "Diffing..." scratch buffer we opened up front so
-        " the user isn't left staring at a stale, empty progress buffer.
-        if s:DirDiffStatusBufNr > 0 && bufexists(s:DirDiffStatusBufNr)
-            silent! execute "bwipeout! " . s:DirDiffStatusBufNr
-        endif
-        let s:DirDiffStatusBufNr = -1
-        redraw | echom "diff found no differences - directories match."
-        return
-    endif
-    call s:DirDiffFinalize(s:DirDiffResultLines, s:DirDiffJobDirA, s:DirDiffJobDirB, s:DirDiffJobCmdArg)
+    call s:DirDiffFinishStreaming()
 endfunction
 
 " Fans the comparison out across the top-level entries of the two
