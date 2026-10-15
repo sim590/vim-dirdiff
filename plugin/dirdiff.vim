@@ -115,6 +115,17 @@ endif
 if !exists("g:DirDiffJobTimeout")
     let g:DirDiffJobTimeout = 0
 endif
+" Minimum number of common entries a directory must contain, at any
+" depth of the fan-out walk, before it's worth splitting further into
+" one job per child instead of becoming a single atomic "diff -r" job
+" for the whole subtree.  0 (the default) auto-derives a sensible value
+" from g:DirDiffMaxJobs instead (see s:DirDiffFanOutThreshold()), so a
+" lone big subdirectory can't become one giant serial job while every
+" other entry is already done, regardless of how many jobs the user
+" allows to run concurrently.
+if !exists("g:DirDiffFanOutThreshold")
+    let g:DirDiffFanOutThreshold = 0
+endif
 
 let g:DirDiffLangString = ""
 if (g:DirDiffForceLang != "")
@@ -860,65 +871,150 @@ function! s:DirDiffMaybeFinish(generation) abort
     call s:DirDiffFinishStreaming()
 endfunction
 
-" Fans the comparison out across the top-level entries of the two
-" directories: entries present on both sides and that are directories on
-" both sides, as well as entries present on both sides that are files,
-" each become one queued diff job (further recursion into subdirectories
-" happens inside that sub-diff thanks to "-r").  Entries that only exist
-" on one side are resolved immediately, without spawning anything, by
-" synthesizing the same "Only in ..." line that "diff --brief" itself
-" would have produced.
-function! s:DirDiffDispatchFanOut(dirA, dirB, cmdarg, generation) abort
-    let entriesA = readdir(a:dirA)
-    let entriesB = readdir(a:dirB)
+" Safety caps bounding how far/how much s:DirDiffCollectFanOutUnits()
+" (below) may recurse/probe into the directory tree while deciding how
+" to partition the fan-out -- not user-facing knobs, just a guard
+" against pathological trees (extremely deep nesting, or an
+" unreasonably large number of directory listings) turning the
+" up-front, fully-synchronous exploration pass itself into a
+" noticeable stall before any job even starts.
+let s:DirDiffFanOutMaxDepth = 4
+let s:DirDiffFanOutProbeBudget = 500
 
-    let setA = {}
-    for name in entriesA
-        let setA[name] = 1
-    endfor
-    let setB = {}
-    for name in entriesB
-        let setB[name] = 1
-    endfor
+" Returns the minimum number of common entries a directory must contain
+" before s:DirDiffCollectFanOutUnits() considers it worth splitting
+" further into one job per child, instead of treating the whole
+" subtree as a single atomic "diff -r" job.  Honours
+" g:DirDiffFanOutThreshold when the user set it explicitly (> 0);
+" otherwise auto-derives a sensible value from the configured
+" concurrency so there's always meaningfully more work available to
+" split across jobs than there are jobs to run it, even when
+" g:DirDiffMaxJobs is small.
+function! s:DirDiffFanOutThreshold() abort
+    if g:DirDiffFanOutThreshold > 0
+        return g:DirDiffFanOutThreshold
+    endif
+    return max([16, 4 * s:DirDiffJobMaxJobs])
+endfunction
 
-    let onlyA = filter(copy(entriesA), '!has_key(setB, v:val)')
-    let onlyB = filter(copy(entriesB), '!has_key(setA, v:val)')
-    let common = filter(copy(entriesA), 'has_key(setB, v:val)')
+" Returns a dict {name -> type} for one directory, where type matches
+" readdirex()'s 'type' field ('dir', 'file', 'link', ...). Prefers
+" readdirex() (name+type in a single round trip) when available,
+" falling back to readdir()+getftype() (one extra stat per entry) on
+" older Vim/NeoVim versions without it.
+function! s:DirDiffListDirTyped(path) abort
+    let result = {}
+    if exists('*readdirex')
+        for entry in readdirex(a:path)
+            let result[entry.name] = entry.type
+        endfor
+    else
+        for name in readdir(a:path)
+            let result[name] = getftype(a:path . s:sep . name)
+        endfor
+    endif
+    return result
+endfunction
 
-    let commonDirs = []
-    let commonFiles = []
-    for name in common
-        if isdirectory(a:dirA . s:sep . name) && isdirectory(a:dirB . s:sep . name)
-            call add(commonDirs, name)
-        else
-            call add(commonFiles, name)
-        endif
-    endfor
+" Recursively walks dirA/dirB deciding, for each common subdirectory,
+" whether it's small enough to become a single atomic "diff -r" job
+" (today's behaviour) or large enough to be worth splitting further so
+" its own children can run as separate concurrent jobs. Falls back to
+" treating the whole subtree as one atomic unit whenever the probe
+" budget or max depth is exhausted -- this NEVER produces worse
+" parallelism than today's single-level fan-out, only ever the same or
+" better.
+"
+" a:units: List of [pathA, pathB] pairs to append to; each becomes one
+"          queued "diff -r --brief" job later.
+" a:onlyLines: List of raw "Only in ..." strings to append to; these
+"          need no job, exactly like today's immediate-entries handling.
+" a:probeBudget: single-element List (mutable counter shared across the
+"          whole recursive walk) decremented once per directory listing
+"          actually performed, bounding total round trips globally.
+"
+" Does not follow symlinks into directories (matches "diff -r"'s own
+" default behaviour, and avoids infinite recursion on symlink cycles):
+" an entry only recurses further when BOTH sides report type == 'dir'
+" exactly; anything else (file, symlink, or a type mismatch between the
+" two sides) becomes an atomic leaf unit, handed to "diff" directly.
+function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines) abort
+    if a:probeBudget[0] <= 0 || a:depth >= s:DirDiffFanOutMaxDepth
+        call add(a:units, [a:dirA, a:dirB])
+        return
+    endif
+    let a:probeBudget[0] -= 1
 
-    " Entries that only exist on one side don't need a diff job: we
-    " already have everything required to synthesize the exact "Only in
-    " ..." line diff --brief itself would output for a root-level
-    " entry.  Collect them now; they're shown right away, below, before
-    " any job has even started.
-    let onlyLines = []
+    let entriesA = s:DirDiffListDirTyped(a:dirA)
+    let entriesB = s:DirDiffListDirTyped(a:dirB)
+
+    let onlyA = filter(keys(entriesA), '!has_key(entriesB, v:val)')
+    let onlyB = filter(keys(entriesB), '!has_key(entriesA, v:val)')
+    let common = filter(keys(entriesA), 'has_key(entriesB, v:val)')
+
     for name in onlyA
-        call add(onlyLines, s:DirDiffDiffOnlyLine . a:dirA . s:DirDiffDiffOnlyLineCenter . name)
+        call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirA . s:DirDiffDiffOnlyLineCenter . name)
     endfor
     for name in onlyB
-        call add(onlyLines, s:DirDiffDiffOnlyLine . a:dirB . s:DirDiffDiffOnlyLineCenter . name)
+        call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirB . s:DirDiffDiffOnlyLineCenter . name)
     endfor
 
-    " Each common directory gets its own job ("-r" in cmdarg makes diff
-    " recurse into it).  Common files are also queued one job per entry,
-    " rather than batched into a single shell invocation chaining several
-    " "diff" calls: cmd.exe, PowerShell and POSIX shells don't agree on an
-    " unconditional command separator, and "&&" would wrongly stop a
-    " batch early anyway on GNU diff's "exit code 1 = differences found".
-    " One job per entry is the simplest option that's correct on every
-    " platform; concurrency is still bounded by g:DirDiffMaxJobs.
-    for name in commonDirs + commonFiles
+    if empty(common)
+        return
+    endif
+
+    if len(common) <= s:DirDiffFanOutThreshold()
+        " Small enough: one atomic job for the whole subtree, no need
+        " to probe any deeper (saves round trips in the common case).
+        call add(a:units, [a:dirA, a:dirB])
+        return
+    endif
+
+    " Large enough to be worth splitting further: recurse into every
+    " common subdirectory (each one independently decides, from its
+    " own listing, whether to split again); common files/symlinks/type
+    " mismatches at this level become atomic leaf units directly.
+    for name in common
         let pathA = a:dirA . s:sep . name
         let pathB = a:dirB . s:sep . name
+        if get(entriesA, name, '') ==# 'dir' && get(entriesB, name, '') ==# 'dir'
+            call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines)
+        else
+            call add(a:units, [pathA, pathB])
+        endif
+    endfor
+endfunction
+
+" Fans the comparison out across the two directories' subtree, using
+" s:DirDiffCollectFanOutUnits() to decide, adaptively, how finely to
+" partition the work: a common subdirectory small enough stays a
+" single atomic "diff -r" job (the plugin's original, first-level-only
+" behaviour), but one large enough to dominate the whole run instead
+" gets split further so its own children can run as separate
+" concurrent jobs too -- this is what keeps a single huge common
+" subdirectory from becoming one serial straggler job while every
+" other (smaller) entry has long since finished.  Entries that only
+" exist on one side, at any depth of that walk, are resolved
+" immediately, without spawning anything, by synthesizing the same
+" "Only in ..." line that "diff --brief" itself would have produced.
+" The whole exploration below is synchronous and completes before any
+" job is queued, so the total job count is known up front exactly as
+" it was before this adaptive partitioning was introduced.
+function! s:DirDiffDispatchFanOut(dirA, dirB, cmdarg, generation) abort
+    let units = []
+    let onlyLines = []
+    call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines)
+
+    " Each unit gets its own job ("-r" in cmdarg makes diff recurse
+    " into it when it's a directory).  Units are queued one job per
+    " entry, rather than batched into a single shell invocation
+    " chaining several "diff" calls: cmd.exe, PowerShell and POSIX
+    " shells don't agree on an unconditional command separator, and
+    " "&&" would wrongly stop a batch early anyway on GNU diff's "exit
+    " code 1 = differences found".  One job per entry is the simplest
+    " option that's correct on every platform; concurrency is still
+    " bounded by g:DirDiffMaxJobs.
+    for [pathA, pathB] in units
         let cmd = g:DirDiffLangString . "diff" . a:cmdarg . " \"" . pathA . "\" \"" . pathB . "\""
         call s:DirDiffQueueJob(cmd, pathA, a:generation)
     endfor
