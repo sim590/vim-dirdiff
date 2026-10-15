@@ -128,17 +128,28 @@ if !exists("g:DirDiffFanOutThreshold")
 endif
 " Optional glob-style include pattern (or several, separated by ','
 " with no space, same convention as g:DirDiffExcludes/g:DirDiffIgnore)
-" restricting the comparison to only the FILE entries whose base name
-" matches at least one of the patterns.  Empty (the default) means no
-" filtering at all -- strictly the same behaviour as before this
-" variable was introduced.  Unlike g:DirDiffExcludes/g:DirDiffAddArgs,
-" this is NOT passed down to the "diff" binary (GNU diff has no
-" "include-only" flag, only "-x" for exclusion); it's instead applied
-" by our own fan-out enumeration (see s:DirDiffCollectFanOutUnits())
-" so that a non-matching file never even gets a job queued for it.
-" Only ever consulted on the async/NeoVim fan-out path; the classic
-" fully-synchronous path has no per-file job queue to filter and so
-" does not honour this setting (see <SID>DirDiff()).
+" restricting the comparison to only the FILE entries whose RELATIVE
+" PATH -- accumulated with "/" as the separator from the root of the
+" two directories being compared, regardless of platform -- matches at
+" least one of the patterns.  A simple pattern with no path separator
+" (eg. "*.xml") behaves exactly as if it only mattered against a base
+" name: glob2regpat() leaves such a pattern unanchored at the start, so
+" it still matches anywhere in the tree, same as before relative paths
+" were introduced.  A pattern with a path component (eg.
+" "subdir/*.xml", or "subdir\*.xml" -- backslashes are
+" normalized to "/" automatically, see s:DirDiffBuildIncludeRegexes())
+" instead scopes the match to that specific subdirectory, since
+" glob2regpat() anchors such a pattern at the start ("^subdir/").
+" Empty (the default) means no filtering at all -- strictly the same
+" behaviour as before this variable was introduced.  Unlike
+" g:DirDiffExcludes/g:DirDiffAddArgs, this is NOT passed down to the
+" "diff" binary (GNU diff has no "include-only" flag, only "-x" for
+" exclusion); it's instead applied by our own fan-out enumeration (see
+" s:DirDiffCollectFanOutUnits()) so that a non-matching file never even
+" gets a job queued for it.  Only ever consulted on the async/NeoVim
+" fan-out path; the classic fully-synchronous path has no per-file job
+" queue to filter and so does not honour this setting (see
+" <SID>DirDiff()).
 if !exists("g:DirDiffIncludePattern")
     let g:DirDiffIncludePattern = ""
 endif
@@ -954,25 +965,35 @@ endfunction
 " Turns g:DirDiffIncludePattern into a List of Vim regex patterns ready
 " for match(), one per comma-separated glob sub-pattern (eg.
 " "*.xml,*.log" becomes two separate regexes), using the native
-" glob2regpat() to do the glob-to-regex conversion.  Returns an empty
-" List when g:DirDiffIncludePattern is "" (the default); that empty
-" List doubles as the "no filtering active at all" sentinel checked by
-" every caller below via empty(), so every caller plumbing this down
-" keeps working unmodified when the feature is unused.
+" glob2regpat() to do the glob-to-regex conversion.  Each sub-pattern
+" has its backslashes normalized to forward slashes first (eg. a
+" Windows-style "subdir\*.xml" typed by the user becomes
+" "subdir/*.xml"), so that it matches identically regardless of
+" which path separator the user typed -- the relative path it's
+" eventually matched against (see s:DirDiffCollectFanOutUnits()) is
+" itself always built with "/" internally, regardless of platform.
+" Returns an empty List when g:DirDiffIncludePattern is "" (the
+" default); that empty List doubles as the "no filtering active at
+" all" sentinel checked by every caller below via empty(), so every
+" caller plumbing this down keeps working unmodified when the feature
+" is unused.
 function! s:DirDiffBuildIncludeRegexes() abort
     if g:DirDiffIncludePattern == ""
         return []
     endif
-    return map(split(g:DirDiffIncludePattern, ','), 'glob2regpat(v:val)')
+    let patterns = map(split(g:DirDiffIncludePattern, ','), 'substitute(v:val, ''\\'', ''/'', ''g'')')
+    return map(patterns, 'glob2regpat(v:val)')
 endfunction
 
-" Returns truthy when "name" (a bare file name, not a full path) matches
-" at least one of the regexes built by s:DirDiffBuildIncludeRegexes()
-" (OR semantics across comma-separated patterns, same as the existing
-" multiple "-x" exclude flags).  Only meaningful when a:includeRegexes
-" is non-empty; callers are expected to check empty(a:includeRegexes)
-" themselves first (meaning "no filter active, include everything")
-" rather than call this function at all in that case.
+" Returns truthy when "relPath" (a file's path relative to the root of
+" the two directories being compared, always "/"-separated internally
+" -- see s:DirDiffCollectFanOutUnits()) matches at least one of the
+" regexes built by s:DirDiffBuildIncludeRegexes() (OR semantics across
+" comma-separated patterns, same as the existing multiple "-x" exclude
+" flags).  Only meaningful when a:includeRegexes is non-empty; callers
+" are expected to check empty(a:includeRegexes) themselves first
+" (meaning "no filter active, include everything") rather than call
+" this function at all in that case.
 function! s:DirDiffNameMatchesInclude(name, includeRegexes) abort
     for regex in a:includeRegexes
         if match(a:name, regex) >= 0
@@ -1022,12 +1043,29 @@ endfunction
 "          safety guards against a pathological tree take precedence
 "          over filtering fidelity in that corner case.
 "
+" a:relPath: path of (a:dirA, a:dirB) relative to the two root
+"          directories originally passed to s:DirDiffDispatchFanOut(),
+"          accumulated one "name" component at a time as the walk
+"          recurses, always joined with "/" internally regardless of
+"          platform -- a purely virtual construction used only for
+"          matching against a:includeRegexes, never a real file system
+"          path.  "" at the root (see s:DirDiffDispatchFanOut()'s call).
+"          Every include-pattern match test below is performed against
+"          this accumulated relative path (joined with the entry's own
+"          "name"), never against a bare "name" alone: this is what
+"          lets a pattern with a path component (eg.
+"          "subdir/*.xml") scope its matches to that specific
+"          subdirectory, while a plain pattern with no path separator
+"          (eg. "*.xml") keeps matching anywhere in the tree exactly as
+"          before, since glob2regpat() leaves such a pattern unanchored
+"          at the start (see s:DirDiffBuildIncludeRegexes()).
+"
 " Does not follow symlinks into directories (matches "diff -r"'s own
 " default behaviour, and avoids infinite recursion on symlink cycles):
 " an entry only recurses further when BOTH sides report type == 'dir'
 " exactly; anything else (file, symlink, or a type mismatch between the
 " two sides) becomes an atomic leaf unit, handed to "diff" directly.
-function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines, includeRegexes) abort
+function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines, includeRegexes, relPath) abort
     if a:probeBudget[0] <= 0 || a:depth >= s:DirDiffFanOutMaxDepth
         call add(a:units, [a:dirA, a:dirB])
         return
@@ -1047,14 +1085,14 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
         " not filtered by file extension); a one-sided FILE is subject
         " to the same filter as common file entries below.
         if !empty(a:includeRegexes) && get(entriesA, name, '') !=# 'dir'
-                    \ && !s:DirDiffNameMatchesInclude(name, a:includeRegexes)
+                    \ && !s:DirDiffNameMatchesInclude(empty(a:relPath) ? name : a:relPath . '/' . name, a:includeRegexes)
             continue
         endif
         call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirA . s:DirDiffDiffOnlyLineCenter . name)
     endfor
     for name in onlyB
         if !empty(a:includeRegexes) && get(entriesB, name, '') !=# 'dir'
-                    \ && !s:DirDiffNameMatchesInclude(name, a:includeRegexes)
+                    \ && !s:DirDiffNameMatchesInclude(empty(a:relPath) ? name : a:relPath . '/' . name, a:includeRegexes)
             continue
         endif
         call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirB . s:DirDiffDiffOnlyLineCenter . name)
@@ -1083,10 +1121,11 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
     for name in common
         let pathA = a:dirA . s:sep . name
         let pathB = a:dirB . s:sep . name
+        let childRelPath = empty(a:relPath) ? name : a:relPath . '/' . name
         if get(entriesA, name, '') ==# 'dir' && get(entriesB, name, '') ==# 'dir'
-            call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes)
+            call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes, childRelPath)
         else
-            if !empty(a:includeRegexes) && !s:DirDiffNameMatchesInclude(name, a:includeRegexes)
+            if !empty(a:includeRegexes) && !s:DirDiffNameMatchesInclude(childRelPath, a:includeRegexes)
                 continue
             endif
             call add(a:units, [pathA, pathB])
@@ -1116,7 +1155,7 @@ function! s:DirDiffDispatchFanOut(dirA, dirB, cmdarg, generation) abort
     let units = []
     let onlyLines = []
     let includeRegexes = s:DirDiffBuildIncludeRegexes()
-    call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines, includeRegexes)
+    call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines, includeRegexes, '')
 
     " Each unit gets its own job ("-r" in cmdarg makes diff recurse
     " into it when it's a directory).  Units are queued one job per
@@ -1809,9 +1848,13 @@ function! <SID>ChangeIgnore()
 endfunction
 
 " Let you modify the file include pattern (NeoVim async fan-out path
-" only -- see g:DirDiffIncludePattern's own definition above).
+" only -- see g:DirDiffIncludePattern's own definition above).  The
+" pattern may include a path prefix to scope it to a specific
+" subdirectory (eg. "subdir/*.xml" or "subdir\*.xml", both
+" equivalent); a plain pattern with no path separator still matches
+" anywhere in the tree as before.
 function! <SID>ChangeIncludePattern()
-    let g:DirDiffIncludePattern = input ("File include pattern (separate multiple patterns with ','): ", g:DirDiffIncludePattern)
+    let g:DirDiffIncludePattern = input ("File include pattern, optionally with a path prefix like 'subdir/*.xml' (separate multiple patterns with ','): ", g:DirDiffIncludePattern)
     echo "\nPress update ('u') to refresh the diff."
 endfunction
 
