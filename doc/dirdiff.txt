@@ -77,10 +77,13 @@ several concurrent jobs.  The comparison is split per subtree: any
 common subdirectory may become its own job, and the remaining files of
 each split level are compared by a single top-level job for that level.
 Because diff itself walks each directory it is given, the exclude
-patterns in g:DirDiffExcludes still apply throughout the fan-out.
+patterns in g:DirDiffExcludes still apply throughout the fan-out.  On
+this path only, g:DirDiffIncludePattern can restrict the comparison to
+the files matching a glob pattern (see |dirdiff-options|).
 
 See |dirdiff-options| for g:DirDiffAsync, g:DirDiffMaxJobs,
-g:DirDiffJobTimeout and g:DirDiffFanOutThreshold.
+g:DirDiffJobTimeout, g:DirDiffFanOutThreshold and
+g:DirDiffIncludePattern.
 
 MAPS                                            *dirdiff-maps*
 
@@ -261,6 +264,17 @@ just listing the new folder name)
 
     let g:DirDiffAddArgs = "-w"
 
+Only compare files whose path relative to the compared root matches one or
+more glob patterns (separated with ',', no spaces).  A pattern with no path
+separator (eg. "*.xml") matches a file name anywhere in the tree, while a
+pattern with a path component (eg. "subdir/*.xml") is anchored at the start
+and scopes the match to that subdirectory; backslashes are treated as
+forward slashes.  Empty (the default) disables filtering entirely.  This is
+honored on the asynchronous path only, where it selects which per-file diff
+jobs are queued: >
+
+    let g:DirDiffIncludePattern = ""
+<
 Run the comparison asynchronously when a usable job API is available
 (Neovim's jobstart(), or classic Vim's job_start() with appendbufline(),
 i.e. Vim 8.2.4257+ and +job), streaming results into the diff window as
