@@ -325,9 +325,12 @@ function! <SID>DirDiff(srcA, srcB)
 
     " A new run invalidates any async job still in flight from a previous
     " one; bump the generation counter so stale callbacks can detect
-    " themselves and no-op (see s:DirDiffOnJobExit()).
+    " themselves and no-op (see s:DirDiffOnJobExit()), then actually stop
+    " those previous jobs so they don't keep running to completion for
+    " nothing (bad on slow/network mounts).
     let s:DirDiffGeneration = s:DirDiffGeneration + 1
     let myGeneration = s:DirDiffGeneration
+    call s:DirDiffStopActiveJobs()
 
     let s:FilenameDiffWindow = tempname()
     " Constructs the diff command-line arguments
