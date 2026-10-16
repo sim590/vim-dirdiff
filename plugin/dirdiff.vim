@@ -372,12 +372,16 @@ function! <SID>DirDiff(srcA, srcB)
     " concurrently; it never affects how promptly results show up.
     call s:DirDiffBuildSkeleton(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg)
 
-    if (s:DirDiffJobMaxJobs <= 1)
+    if (s:DirDiffJobMaxJobs <= 1 || !isdirectory(DirDiffAbsSrcA) || !isdirectory(DirDiffAbsSrcB))
         " No fan-out: a single job runs the whole comparison (still
         " "-r" recursive over the entire tree being compared), just
         " non-blocking, with its stdout streamed into the skeleton
         " line-by-line exactly like a fan-out sub-job's output would
-        " be.
+        " be.  Also taken when either source isn't a directory: the
+        " fan-out enumerator would silently produce empty listings for
+        " a bad path (NeoVim's readdir() returns [] rather than
+        " erroring) and flood the buffer with bogus "Only in" entries,
+        " whereas the single job lets diff itself fail and report."
         let cmd = g:DirDiffLangString . "diff" . cmdarg . " \"".DirDiffAbsSrcA."\" \"".DirDiffAbsSrcB."\""
         call s:DirDiffQueueJob(cmd, DirDiffAbsSrcA." <-> ".DirDiffAbsSrcB, myGeneration)
         let s:DirDiffJobsTotal = 1
