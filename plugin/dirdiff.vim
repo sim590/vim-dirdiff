@@ -206,6 +206,16 @@ let s:DirDiffJobCmdArgList = []
 " parallelism; streaming always applies the same way regardless.  -1
 " when none is active.
 let s:DirDiffStatusBufNr = -1
+" 1 while the live result buffer still carries its trailing progress
+" line; s:DirDiffFinishStreaming() clears it once every job is done.
+" s:DirDiffStreamAppend() uses it to tell whether result lines may be
+" inserted above that progress line or, after finalization, must simply
+" be appended at the end.  That matters because Vim can still deliver
+" buffered channel data (an out_cb) after the job's exit_cb already
+" triggered the "all jobs done" finalize: without the flag the insert
+" would run above a progress line that no longer exists and the
+" following progress refresh would overwrite the last real result line.
+let s:DirDiffStreaming = 0
 " Minimum time, in seconds (see reltime()/reltimefloat()), between two
 " successive "visual refreshes" (window switch + :redraw) triggered by
 " s:DirDiffStreamAppend().  See that function's comment for why this
@@ -457,6 +467,7 @@ function! <SID>DirDiff(srcA, srcB)
     let s:DirDiffActiveJobs = []
     let s:DirDiffJobsTotal = 0
     let s:DirDiffJobsDone = 0
+    let s:DirDiffStreaming = 1
     let s:DirDiffJobDirA = DirDiffAbsSrcA
     let s:DirDiffJobDirB = DirDiffAbsSrcB
     let s:DirDiffJobCmdArgList = s:BuildDiffCmdArgList()
@@ -776,15 +787,23 @@ function! s:DirDiffStreamAppend(lines) abort
         return
     endif
     call setbufvar(s:DirDiffStatusBufNr, '&modifiable', 1)
-    if !empty(a:lines)
-        " Insert right above the trailing progress line, so new
-        " entries land right after the last one already shown, in
-        " arrival order -- no full re-sort/rebuild happens here, see
-        " s:DirDiffFinishStreaming() for the single sort pass done
-        " once every job is done.
-        call appendbufline(s:DirDiffStatusBufNr, s:DirDiffBufLineCount(s:DirDiffStatusBufNr) - 1, a:lines)
+    if s:DirDiffStreaming
+        if !empty(a:lines)
+            " Insert right above the trailing progress line, so new
+            " entries land right after the last one already shown, in
+            " arrival order -- no full re-sort/rebuild happens here, see
+            " s:DirDiffFinishStreaming() for the single sort pass done
+            " once every job is done.
+            call appendbufline(s:DirDiffStatusBufNr, s:DirDiffBufLineCount(s:DirDiffStatusBufNr) - 1, a:lines)
+        endif
+        call setbufline(s:DirDiffStatusBufNr, '$', s:DirDiffProgressText())
+    elseif !empty(a:lines)
+        " s:DirDiffFinishStreaming() already removed the progress line:
+        " this is buffered output delivered after the run was finalized,
+        " so append it at the very end instead of overwriting the last
+        " real result line with a progress line (see s:DirDiffStreaming).
+        call appendbufline(s:DirDiffStatusBufNr, '$', a:lines)
     endif
-    call setbufline(s:DirDiffStatusBufNr, '$', s:DirDiffProgressText())
     call setbufvar(s:DirDiffStatusBufNr, '&modifiable', 0)
     call setbufvar(s:DirDiffStatusBufNr, '&modified', 0)
 
@@ -824,6 +843,7 @@ function! s:DirDiffFinishStreaming() abort
         return
     endif
     let bufNr = s:DirDiffStatusBufNr
+    let s:DirDiffStreaming = 0
     let savedWin = win_getid()
     call <SID>GotoDiffWindow()
 
