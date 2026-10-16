@@ -1208,6 +1208,36 @@ function! s:DirDiffNameMatchesInclude(relPath, includeRegexes) abort
     return 0
 endfunction
 
+" Turns g:DirDiffExcludes into a List of Vim regex patterns ready for
+" match(), one per comma-separated glob sub-pattern, using glob2regpat()
+" exactly like "diff" -x does.  Returns an empty List when
+" g:DirDiffExcludes is "" (the default).
+function! s:DirDiffBuildExcludeRegexes() abort
+    if g:DirDiffExcludes == ""
+        return []
+    endif
+    return map(split(g:DirDiffExcludes, ','), 'glob2regpat(v:val)')
+endfunction
+
+" Returns truthy when "name" (a bare base name) matches one of the
+" regexes built by s:DirDiffBuildExcludeRegexes(), mirroring "diff"'s
+" own "-x": matched against the base name, for files and directories
+" alike, case-insensitively when g:DirDiffIgnoreFileNameCase is set
+" (matching diff's --ignore-file-name-case).  Only needed on the
+" include-pattern path: there each matching file becomes its own
+" per-file job passing explicit operands, and "diff" does not apply
+" "-x" to explicit operands -- so the exclusion has to be done here.
+" The default, non-include path leaves exclusion entirely to "diff".
+function! s:DirDiffIsExcluded(name, excludesRegexes) abort
+    for regex in a:excludesRegexes
+        let re = g:DirDiffIgnoreFileNameCase ? '\c' . regex : regex
+        if match(a:name, re) >= 0
+            return 1
+        endif
+    endfor
+    return 0
+endfunction
+
 " Recursively walks dirA/dirB deciding how to partition the comparison
 " so it can fan out across several concurrent jobs while staying
 " correct and avoiding a spawn storm.
@@ -1263,6 +1293,13 @@ endfunction
 " a:includeRegexes: List of regexes from s:DirDiffBuildIncludeRegexes();
 "          empty means "no filtering", the default, strictly unchanged
 "          behaviour.
+" a:excludesRegexes: List of regexes from
+"          s:DirDiffBuildExcludeRegexes(); only consulted when
+"          a:includeRegexes is non-empty, to skip entries whose base
+"          name matches g:DirDiffExcludes (files and directories alike,
+"          and excluded directories are not recursed into).  The
+"          non-include path ignores this: there "diff" itself applies
+"          its own "-x" to the directories it walks.
 " a:relPath: path of (a:dirA, a:dirB) relative to the root passed to
 "          s:DirDiffDispatchFanOut(), accumulated one "name" component
 "          at a time and always joined with "/", regardless of platform
@@ -1279,7 +1316,7 @@ endfunction
 " default behaviour, and avoids infinite recursion on symlink cycles):
 " an entry only recurses further when BOTH sides report type == 'dir'
 " exactly.
-function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines, includeRegexes, relPath, hidden) abort
+function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines, includeRegexes, excludesRegexes, relPath, hidden) abort
     if a:probeBudget[0] <= 0 || a:depth >= s:DirDiffFanOutMaxDepth
         " Safety cap reached: fall back to one atomic "diff -r" job for
         " the whole remaining subtree.  NOTE: when an include pattern is
@@ -1307,6 +1344,9 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
         " files-only unit that would normally report them is never
         " created on this path.
         for name in onlyA
+            if s:DirDiffIsExcluded(name, a:excludesRegexes)
+                continue
+            endif
             if get(entriesA, name, '') ==# 'dir'
                 " A one-sided directory carries no file name to match
                 " against; the pattern hides it.
@@ -1318,6 +1358,9 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
             endif
         endfor
         for name in onlyB
+            if s:DirDiffIsExcluded(name, a:excludesRegexes)
+                continue
+            endif
             if get(entriesB, name, '') ==# 'dir'
                 let a:hidden[0] += 1
             elseif s:DirDiffNameMatchesInclude(empty(a:relPath) ? name : a:relPath . '/' . name, a:includeRegexes)
@@ -1336,11 +1379,18 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
         " type mismatch) is compared by its own per-file job when its
         " relative path matches, and skipped otherwise.
         for name in common
+            " An excluded entry is skipped entirely -- including a
+            " common subdirectory, which is then not recursed into --
+            " because these per-file operands never reach "diff"'s own
+            " "-x" handling.
+            if s:DirDiffIsExcluded(name, a:excludesRegexes)
+                continue
+            endif
             let pathA = a:dirA . s:sep . name
             let pathB = a:dirB . s:sep . name
             let childRelPath = empty(a:relPath) ? name : a:relPath . '/' . name
             if get(entriesA, name, '') ==# 'dir' && get(entriesB, name, '') ==# 'dir'
-                call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes, childRelPath, a:hidden)
+                call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes, a:excludesRegexes, childRelPath, a:hidden)
             elseif s:DirDiffNameMatchesInclude(childRelPath, a:includeRegexes)
                 call add(a:units, [pathA, pathB])
             else
@@ -1388,7 +1438,7 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
         let pathA = a:dirA . s:sep . name
         let pathB = a:dirB . s:sep . name
         if get(entriesA, name, '') ==# 'dir' && get(entriesB, name, '') ==# 'dir'
-            call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes, a:relPath, a:hidden)
+            call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes, a:excludesRegexes, a:relPath, a:hidden)
         else
             let filesOnly = 1
         endif
@@ -1427,8 +1477,9 @@ function! s:DirDiffDispatchFanOut(dirA, dirB, generation) abort
     let units = []
     let onlyLines = []
     let includeRegexes = s:DirDiffBuildIncludeRegexes()
+    let excludesRegexes = s:DirDiffBuildExcludeRegexes()
     let hidden = [0]
-    call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines, includeRegexes, '', hidden)
+    call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines, includeRegexes, excludesRegexes, '', hidden)
     " Remember how many entries the include pattern made the walk skip,
     " for s:DirDiffFinishStreaming()'s "nothing to show" message.  Zero
     " whenever no pattern is active.
