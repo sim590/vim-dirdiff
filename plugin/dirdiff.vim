@@ -467,7 +467,7 @@ endfunction
 " Formats the trailing progress line shown at the bottom of the live
 " async streaming buffer while jobs are still in flight.
 function! s:DirDiffProgressText() abort
-    return "Diffing... " . s:DirDiffJobsDone . "/" . s:DirDiffJobsTotal . " lots termines"
+    return "Diffing... " . s:DirDiffJobsDone . "/" . s:DirDiffJobsTotal . " jobs done"
 endfunction
 
 " Applies to a single line of raw "diff --brief"-style output exactly
@@ -773,7 +773,7 @@ function! s:DirDiffPumpQueue(generation) abort
             " Could not even start the job; treat it as an immediate
             " error so the overall run doesn't hang forever.
             let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
-            let errLine = s:DirDiffTransformLine("[ERREUR] comparaison impossible : " . work.desc . " (demarrage du job echoue)", s:DirDiffJobDirA, s:DirDiffJobDirB)
+            let errLine = s:DirDiffTransformLine("[ERROR] could not compare: " . work.desc . " (job failed to start)", s:DirDiffJobDirA, s:DirDiffJobDirB)
             call s:DirDiffStreamAppend([errLine])
         endif
     endwhile
@@ -841,7 +841,7 @@ function! s:DirDiffOnJobExit(generation, pending, desc, job_id, data, event) abo
     " (eg. permission denied, path not found).  Surface errors instead of
     " silently swallowing them.
     if a:data != 0 && a:data != 1
-        call add(lines, "[ERREUR] comparaison impossible : " . a:desc . " (code " . a:data . ")")
+        call add(lines, "[ERROR] could not compare: " . a:desc . " (code " . a:data . ")")
     endif
 
     let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
