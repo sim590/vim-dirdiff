@@ -192,7 +192,9 @@ let s:DirDiffJobsDone = 0
 let s:DirDiffJobMaxJobs = 1
 let s:DirDiffJobDirA = ""
 let s:DirDiffJobDirB = ""
-let s:DirDiffJobCmdArg = ""
+" Argv List of "diff" arguments shared by every job of the current async
+" run (see s:BuildDiffCmdArgList()); set once per DirDiff() invocation.
+let s:DirDiffJobCmdArgList = []
 " Buffer number of the live result buffer, built up front by
 " s:DirDiffBuildSkeleton() and streamed into progressively by
 " s:DirDiffStreamAppend() as job output arrives -- the one and only
@@ -219,33 +221,30 @@ let s:DirDiffLastRedrawTime = []
 " when async execution isn't available/enabled, the same way callers
 " already treat a jobstart() failure.
 "
-" Mirrors the &shell swap that <SID>DirDiffExec() does for the
-" synchronous path: NeoVim resolves &shell/&shellcmdflag synchronously
-" at jobstart() call time to build the process argv, so a save/restore
-" done strictly around the jobstart() call (not around the job's whole
-" lifetime) is enough to honour g:DirDiffForceShell for async jobs too.
+" a:cmd is an argv List (never a shell string), so jobstart() execs it
+" directly without any shell: g:DirDiffForceShell, which only ever
+" affected the synchronous "!" path's shell, no longer applies to async
+" jobs.  The forced LANG is passed through the job's 'env' option
+" rather than a "LANG=..." shell prefix, so it no longer depends on the
+" user's shell at all.
 function! s:JobStart(cmd, callbacks) abort
     if !g:DirDiffAsync || !has('nvim')
         return -1
     endif
-    let shellChanged = (g:DirDiffForceShell != "")
-    if shellChanged
-        let shell_save = &shell
-        let &shell = g:DirDiffForceShell
-    endif
-    " jobstart() can throw synchronously (eg. E903 if &shell itself points
-    " to a nonexistent executable); guard with try/finally so &shell is
-    " always restored, and fold that failure into the same "-1 = could
-    " not start" contract the rest of the plugin already handles.
+    " jobstart() can throw synchronously (eg. the executable doesn't
+    " exist); guard it and fold that failure into the same "-1 = could
+    " not start" contract the rest of the plugin already handles.  The
+    " callbacks dict is copied (extend() mutates its first argument) so
+    " adding 'env' never touches the caller's dict.
     let jobId = -1
     try
-        let jobId = jobstart(a:cmd, a:callbacks)
+        if g:DirDiffForceLang != ""
+            let jobId = jobstart(a:cmd, extend(copy(a:callbacks), {'env': {'LANG': g:DirDiffForceLang}}))
+        else
+            let jobId = jobstart(a:cmd, a:callbacks)
+        endif
     catch
         let jobId = -1
-    finally
-        if shellChanged
-            let &shell = shell_save
-        endif
     endtry
     return jobId
 endfunction
@@ -365,7 +364,7 @@ function! <SID>DirDiff(srcA, srcB)
     let s:DirDiffJobsDone = 0
     let s:DirDiffJobDirA = DirDiffAbsSrcA
     let s:DirDiffJobDirB = DirDiffAbsSrcB
-    let s:DirDiffJobCmdArg = cmdarg
+    let s:DirDiffJobCmdArgList = s:BuildDiffCmdArgList()
     let s:DirDiffJobMaxJobs = max([1, min([64, g:DirDiffMaxJobs])])
 
     " Every async run -- whether it ends up running a single diff job
@@ -386,9 +385,9 @@ function! <SID>DirDiff(srcA, srcB)
         " fan-out enumerator would silently produce empty listings for
         " a bad path (NeoVim's readdir() returns [] rather than
         " erroring) and flood the buffer with bogus "Only in" entries,
-        " whereas the single job lets diff itself fail and report."
-        let cmd = g:DirDiffLangString . "diff" . cmdarg . " \"".DirDiffAbsSrcA."\" \"".DirDiffAbsSrcB."\""
-        call s:DirDiffQueueJob(cmd, DirDiffAbsSrcA." <-> ".DirDiffAbsSrcB, myGeneration)
+        " whereas the single job lets diff itself fail and report.
+        let argv = ['diff'] + s:DirDiffJobCmdArgList + [DirDiffAbsSrcA, DirDiffAbsSrcB]
+        call s:DirDiffQueueJob(argv, DirDiffAbsSrcA." <-> ".DirDiffAbsSrcB, myGeneration)
         let s:DirDiffJobsTotal = 1
         call s:DirDiffPumpQueue(myGeneration)
     else
@@ -401,9 +400,10 @@ function! <SID>DirDiff(srcA, srcB)
 endfunction
 
 " Builds the diff command-line arguments (everything except the two paths
-" being compared) from the plugin's global options.  Shared by the
-" single-job synchronous/async path and by every fan-out sub-job, so
-" :ChangeExcludes/:ChangeIgnore/:ChangeArguments keep applying everywhere.
+" being compared) from the plugin's global options, as a single shell
+" string.  Used by the classic synchronous path and for the "Diff Args:"
+" header line; the async path builds an argv List instead via
+" s:BuildDiffCmdArgList() below, which must be kept in sync with this.
 function! s:BuildDiffCmdArg() abort
     let cmdarg = " -r --brief"
 
@@ -425,6 +425,43 @@ function! s:BuildDiffCmdArg() abort
         let cmdarg = cmdarg.' -I"'.substitute(g:DirDiffIgnore, ',', '" -I"', 'g').'"'
     endif
     return cmdarg
+endfunction
+
+" Argv-List equivalent of s:BuildDiffCmdArg() above: same options in the
+" same order, but returned as a List of individual "diff" arguments
+" instead of one shell string.  Used to launch async jobs (NeoVim
+" jobstart(), and later classic Vim's job_start) without going through a
+" shell, so paths and patterns containing spaces, quotes or non-ASCII
+" bytes need no quoting.  Must be kept in sync with s:BuildDiffCmdArg().
+function! s:BuildDiffCmdArgList() abort
+    let argv = ['-r', '--brief']
+
+    if (g:DirDiffIgnoreFileNameCase)
+        call add(argv, '--ignore-file-name-case')
+    endif
+
+    " If variable is set, we ignore the case
+    if (g:DirDiffIgnoreCase)
+        call add(argv, '-i')
+    endif
+    if (g:DirDiffAddArgs != "")
+        " Whitespace-split: g:DirDiffAddArgs is a convenience escape
+        " hatch for extra flags, so it cannot express an argument that
+        " itself contains a space (the sync path has the same
+        " limitation).
+        call extend(argv, split(g:DirDiffAddArgs))
+    endif
+    if (g:DirDiffExcludes != "")
+        for pattern in split(g:DirDiffExcludes, ',')
+            call extend(argv, ['-x', pattern])
+        endfor
+    endif
+    if (g:DirDiffIgnore != "")
+        for pattern in split(g:DirDiffIgnore, ',')
+            call extend(argv, ['-I', pattern])
+        endfor
+    endif
+    return argv
 endfunction
 
 " Applies every buffer-local option, keymap, syntax rule and cosmetic
@@ -739,9 +776,9 @@ function! s:DirDiffFinishStreaming() abort
     redraw
 endfunction
 
-" Adds a unit of work (a complete "diff ..." shell command comparing two
-" paths) to the pending job queue.  "desc" is only used for
-" progress/error reporting.
+" Adds a unit of work (a complete "diff ..." argv List comparing two
+" paths, see s:BuildDiffCmdArgList()) to the pending job queue.  "desc"
+" is only used for progress/error reporting.
 function! s:DirDiffQueueJob(cmd, desc, generation) abort
     call add(s:DirDiffJobQueue, {'cmd': a:cmd, 'desc': a:desc, 'generation': a:generation})
 endfunction
@@ -1094,26 +1131,28 @@ function! s:DirDiffDispatchFanOut(dirA, dirB, cmdarg, generation) abort
 
     " Each unit gets its own job: atomic units ([pathA, pathB]) are
     " "diff -r" over a whole subtree, while files-only units
-    " ([dirA, dirB, 'no-r']) are the same command with the leading " -r"
-    " dropped, so "diff" only looks at that one level.  Units are
-    " queued one job per entry, rather than batched into a single shell
-    " invocation chaining several "diff" calls: cmd.exe, PowerShell and
-    " POSIX shells don't agree on an unconditional command separator,
-    " and "&&" would wrongly stop a batch early anyway on GNU diff's
-    " "exit code 1 = differences found".  One job per entry is the
-    " simplest option that's correct on every platform; concurrency is
-    " still bounded by g:DirDiffMaxJobs.
+    " ([dirA, dirB, 'no-r']) are the same argv with the leading '-r'
+    " dropped, so "diff" only looks at that one level.  The command is
+    " built as an argv List (never a shell string), so paths containing
+    " spaces, quotes or non-ASCII bytes need no quoting.  Units are
+    " queued one job per entry rather than batched into a single
+    " command: there is no cross-platform way to chain several "diff"
+    " calls (and "&&" would wrongly stop a batch early anyway on GNU
+    " diff's "exit code 1 = differences found").  One job per entry is
+    " the simplest option that's correct on every platform; concurrency
+    " is still bounded by g:DirDiffMaxJobs.
     for unit in units
         let pathA = unit[0]
         let pathB = unit[1]
-        let cmdarg = a:cmdarg
+        let args = s:BuildDiffCmdArgList()
         if get(unit, 2, '') ==# 'no-r'
-            " Drop the leading " -r " so this job compares just this
-            " level's own entries (top level only).
-            let cmdarg = substitute(a:cmdarg, '^ -r ', ' ', '')
+            " '-r' is always the first element (see
+            " s:BuildDiffCmdArgList()); dropping it limits this job to
+            " the level's own entries (top level only).
+            call remove(args, 0)
         endif
-        let cmd = g:DirDiffLangString . "diff" . cmdarg . " \"" . pathA . "\" \"" . pathB . "\""
-        call s:DirDiffQueueJob(cmd, pathA, a:generation)
+        let argv = ['diff'] + args + [pathA, pathB]
+        call s:DirDiffQueueJob(argv, pathA, a:generation)
     endfor
 
     let s:DirDiffJobsTotal = len(s:DirDiffJobQueue)
