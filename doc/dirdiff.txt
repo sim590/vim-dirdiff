@@ -46,6 +46,42 @@ For example:
     :DirDiff ../something/dir1 /usr/bin/somethingelse/dir2
 <
 
+ASYNCHRONOUS EXECUTION                          *dirdiff-async*
+
+When a job API is available, :DirDiff runs the comparison in the
+background instead of blocking on a ":!diff" call, and streams results
+into the diff window as they arrive.  This uses Neovim's jobstart(), or
+classic Vim's job_start() (Vim 8.2.4257+, with the |+job| feature).
+Without a usable job API, or when g:DirDiffAsync is set to 0, the
+classic synchronous path is used and :DirDiff blocks until the
+comparison finishes.
+
+While an asynchronous run is in progress the list buffer is built up
+immediately and a progress line is shown at the bottom, for example: >
+
+    Diffing... 3/7 jobs done
+<
+It is removed once every job is done.  "Only in" entries that need no
+diff job are listed right away.  If a diff process fails, an entry like
+the following is shown in the list instead: >
+
+    [ERROR] could not compare: <paths> (code 2): <message>
+<
+"(code N)" is diff's exit status, and the trailing message is a short
+snippet of whatever diff wrote to standard error (omitted when diff
+wrote nothing to standard error).
+
+By default a single diff process compares the whole tree.  Setting
+g:DirDiffMaxJobs to a value greater than 1 fans the work out across
+several concurrent jobs.  The comparison is split per subtree: any
+common subdirectory may become its own job, and the remaining files of
+each split level are compared by a single top-level job for that level.
+Because diff itself walks each directory it is given, the exclude
+patterns in g:DirDiffExcludes still apply throughout the fan-out.
+
+See |dirdiff-options| for g:DirDiffAsync, g:DirDiffMaxJobs,
+g:DirDiffJobTimeout and g:DirDiffFanOutThreshold.
+
 MAPS                                            *dirdiff-maps*
 
 The following commands can be used inside the diff window:
@@ -184,7 +220,9 @@ If empty, the default shell would not be changed before running the diff
 command.  If not, then the shell would be set to this before running the diff
 command (and restored after the execuation).  This is useful for people who
 are using shells that are not compatible.  If you are getting a message saying
-that there's no diff for some shell, you may want to set this to "sh".
+that there's no diff for some shell, you may want to set this to "sh".  This
+only affects the synchronous path; asynchronous jobs run the diff command
+directly, without a shell (see |dirdiff-async|).
 
 Dynamically figure out the diff text.  If you are using and i18n version of
 diff, this will try to get the specific diff text during runtime.  It's turned
@@ -222,6 +260,34 @@ spaces or "-N" to list all new files even when inside a new folder (instead of
 just listing the new folder name)
 
     let g:DirDiffAddArgs = "-w"
+
+Run the comparison asynchronously when a usable job API is available
+(Neovim's jobstart(), or classic Vim's job_start() with appendbufline(),
+i.e. Vim 8.2.4257+ and +job), streaming results into the diff window as
+they arrive.  Set to 0 to force the classic synchronous path.  Defaults
+to 1 when a usable job API exists, 0 otherwise: >
+
+    let g:DirDiffAsync = 1
+<
+Maximum number of diff processes to run concurrently.  The value is
+clamped to the range [1, 64].  The default, 1, runs a single
+asynchronous diff job with no fan-out; a higher value splits the
+comparison per subtree across several concurrent jobs (see
+|dirdiff-async|): >
+
+    let g:DirDiffMaxJobs = 1
+<
+Per-job timeout, in milliseconds; a job running longer than this is
+stopped.  The default, 0, disables the timeout: >
+
+    let g:DirDiffJobTimeout = 0
+<
+Minimum number of common entries a directory must contain before the
+fan-out splits it into per-subtree jobs.  The default, 0, derives a
+value from g:DirDiffMaxJobs instead (currently max(16, 4 * MaxJobs)): >
+
+    let g:DirDiffFanOutThreshold = 0
+<
 
 OPTIONS EXAMPLE                                 *dirdiff-options-example*
 

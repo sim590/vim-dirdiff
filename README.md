@@ -44,6 +44,16 @@ If you use pathogen, you can use :Helptags to regenerate documentation.  You
 then can see ":h dirdiff" for more information.
 
 
+## Asynchronous execution
+
+When a job API is available (Neovim, or Vim 8.2.4257+ with `+job`),
+`:DirDiff` runs the comparison in the background and streams results into
+the diff window as they arrive; `g:DirDiffMaxJobs` can run several jobs
+concurrently.  See `:help dirdiff-async` (or `doc/dirdiff.txt`) for the
+details and for the `g:DirDiffAsync`, `g:DirDiffMaxJobs`,
+`g:DirDiffJobTimeout` and `g:DirDiffFanOutThreshold` options.
+
+
 ## License
 
 Copyright (c) 2001-2015 William Lee. (BSD-Like)  See doc/dirdiff.txt.
