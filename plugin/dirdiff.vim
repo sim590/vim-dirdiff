@@ -994,14 +994,20 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
     let onlyB = filter(keys(entriesB), '!has_key(entriesA, v:val)')
     let common = filter(keys(entriesA), 'has_key(entriesB, v:val)')
 
-    for name in onlyA
-        call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirA . s:DirDiffDiffOnlyLineCenter . name)
-    endfor
-    for name in onlyB
-        call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirB . s:DirDiffDiffOnlyLineCenter . name)
-    endfor
-
     if empty(common)
+        " Nothing in common: no job will look at this directory at all
+        " (neither an atomic "diff -r" job nor a files-only unit, see
+        " below), so every one-sided entry at this level is synthesized
+        " here, exactly as "diff --brief" would have printed it.  Any
+        " level that DOES get a job reports its own one-sided entries,
+        " so synthesizing them there too would duplicate them -- hence
+        " this is the only place one-sided lines are ever synthesized.
+        for name in onlyA
+            call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirA . s:DirDiffDiffOnlyLineCenter . name)
+        endfor
+        for name in onlyB
+            call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirB . s:DirDiffDiffOnlyLineCenter . name)
+        endfor
         return
     endif
 
