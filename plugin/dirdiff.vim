@@ -879,7 +879,12 @@ function! s:DirDiffOnJobExit(generation, pending, desc, job_id, data, event) abo
         endif
         call add(lines, errLine)
     endif
-    call remove(s:DirDiffJobStderr, a:job_id)
+    " A clean job may never have produced stderr at all, so only drop the
+    " stored text when there actually is some (remove() errors on a
+    " missing key).
+    if has_key(s:DirDiffJobStderr, a:job_id)
+        call remove(s:DirDiffJobStderr, a:job_id)
+    endif
 
     let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
 
