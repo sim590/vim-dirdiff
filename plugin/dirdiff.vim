@@ -818,7 +818,11 @@ function! s:DirDiffOnJobStdout(generation, pending, job_id, data, event) abort
     let chunk[0] = a:pending[0] . chunk[0]
     let a:pending[0] = remove(chunk, -1)
     if !empty(chunk)
-        let transformed = map(chunk, 's:DirDiffTransformLine(v:val, s:DirDiffJobDirA, s:DirDiffJobDirB)')
+        " Normalize CRLF like the classic sync path does via readfile():
+        " a trailing '\r' left over from "\r\n" line endings would
+        " otherwise show up as a stray '^M' in async mode only.
+        let lines = map(chunk, 'substitute(v:val, ''\r$'', '''', '''')')
+        let transformed = map(lines, 's:DirDiffTransformLine(v:val, s:DirDiffJobDirA, s:DirDiffJobDirB)')
         call s:DirDiffStreamAppend(transformed)
     endif
 endfunction
