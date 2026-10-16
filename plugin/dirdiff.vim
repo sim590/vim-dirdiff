@@ -886,7 +886,11 @@ endfunction
 " Message used when a run completes with no entry to display; kept in
 " one function so the on-screen and background finalize paths agree.
 function! s:DirDiffNoDiffMessage() abort
-    return "diff found no differences"
+    let msg = "diff found no differences"
+    if s:DirDiffHiddenCount > 0
+        let msg = msg . " (" . s:DirDiffHiddenCount . " entries hidden by include pattern)"
+    endif
+    return msg
 endfunction
 
 " Finalize the result buffer when its window is not in the current tab
@@ -1008,7 +1012,9 @@ function! s:DirDiffFinishStreaming() abort
     if line('$') <= s:DirDiffFirstDiffLine
         " Nothing was ever streamed in (no "only in" entries, every
         " common entry diffed identical): behave like the synchronous
-        " path and don't leave a stray, empty result buffer behind.
+        " path and don't leave a stray, empty result buffer behind.  If
+        " the include pattern hid entries, say so, so an empty result
+        " isn't mistaken for "the trees are identical".
         call win_gotoid(savedWin)
         silent! execute "bwipeout! " . bufNr
         let s:DirDiffStatusBufNr = -1
@@ -2336,6 +2342,9 @@ endfunction
 " with no path separator still matches anywhere in the tree as before.
 function! <SID>ChangeIncludePattern()
     let g:DirDiffIncludePattern = input ("File include pattern, optionally with a path prefix like 'subdir/*.xml' (separate multiple patterns with ','): ", g:DirDiffIncludePattern)
+    if g:DirDiffAsync == 0
+        echom "Note: g:DirDiffIncludePattern is only honored on the asynchronous path (g:DirDiffAsync is 0)."
+    endif
     echo "\nPress update ('u') to refresh the diff."
 endfunction
 
