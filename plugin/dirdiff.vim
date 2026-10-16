@@ -818,6 +818,14 @@ function! s:DirDiffOnJobStdout(generation, pending, job_id, data, event) abort
     let chunk[0] = a:pending[0] . chunk[0]
     let a:pending[0] = remove(chunk, -1)
     if !empty(chunk)
+        " Drop "Common subdirectories: ..." lines: a files-only unit
+        " (no -r, see s:DirDiffCollectFanOutUnits()) emits one per
+        " common subdirectory child, but those subdirs are recursed as
+        " their own units, so their content is reported there and the
+        " line itself is pure noise.  With -r these never appear, so
+        " filtering globally is safe.  Done before the CR strip and the
+        " line transform below.
+        call filter(chunk, 'v:val !~# ''^Common subdirectories: ''')
         " Normalize CRLF like the classic sync path does via readfile():
         " a trailing '\r' left over from "\r\n" line endings would
         " otherwise show up as a stray '^M' in async mode only.
@@ -958,19 +966,38 @@ function! s:DirDiffListDirTyped(path) abort
     return result
 endfunction
 
-" Recursively walks dirA/dirB deciding, for each common subdirectory,
-" whether it's small enough to become a single atomic "diff -r" job
-" (today's behaviour) or large enough to be worth splitting further so
-" its own children can run as separate concurrent jobs. Falls back to
-" treating the whole subtree as one atomic unit whenever the probe
-" budget or max depth is exhausted -- this NEVER produces worse
-" parallelism than today's single-level fan-out, only ever the same or
-" better.
+" Recursively walks dirA/dirB deciding how to partition the comparison
+" so it can fan out across several concurrent jobs while staying
+" correct and avoiding a spawn storm:
 "
-" a:units: List of [pathA, pathB] pairs to append to; each becomes one
-"          queued "diff -r --brief" job later.
+"  - the whole subtree becomes one atomic "diff -r" job when it has few
+"    enough common entries (the plugin's original behaviour);
+"  - otherwise it splits per SUBTREE: each common subdirectory (both
+"    sides type == 'dir') recurses independently, while ALL of the
+"    level's remaining common entries (files, symlinks, type
+"    mismatches) are covered by a single per-level "files-only" unit
+"    instead of one process per file.  That unit is a plain
+"    "diff --brief <dirA> <dirB>" (no -r), so "diff" itself reports the
+"    level's common-file differences, its one-sided entries (files AND
+"    dirs), and a "Common subdirectories: ..." line per common subdir
+"    child -- the latter dropped by s:DirDiffOnJobStdout(), since those
+"    subdirs are recursed as their own units;
+"  - a level with no common entries at all gets no job; its one-sided
+"    entries are synthesized immediately as "Only in ..." lines.
+"
+" A files-only unit exists iff the level has at least one common
+" non-dir child OR at least one one-sided child; when it exists, no
+" one-sided line is synthesized at that level (the unit reports them).
+" Falls back to treating the whole subtree as one atomic unit whenever
+" the probe budget or max depth is exhausted -- this NEVER produces
+" worse parallelism than the original single-level fan-out.
+"
+" a:units: List of units to append to; each is either [pathA, pathB]
+"          (an atomic "diff -r" job) or [dirA, dirB, 'no-r'] (a
+"          files-only unit covering one directory level).
 " a:onlyLines: List of raw "Only in ..." strings to append to; these
-"          need no job, exactly like today's immediate-entries handling.
+"          need no job, exactly like the original immediate-entries
+"          handling.
 " a:probeBudget: single-element List (mutable counter shared across the
 "          whole recursive walk) decremented once per directory listing
 "          actually performed, bounding total round trips globally.
@@ -978,8 +1005,7 @@ endfunction
 " Does not follow symlinks into directories (matches "diff -r"'s own
 " default behaviour, and avoids infinite recursion on symlink cycles):
 " an entry only recurses further when BOTH sides report type == 'dir'
-" exactly; anything else (file, symlink, or a type mismatch between the
-" two sides) becomes an atomic leaf unit, handed to "diff" directly.
+" exactly.
 function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines) abort
     if a:probeBudget[0] <= 0 || a:depth >= s:DirDiffFanOutMaxDepth
         call add(a:units, [a:dirA, a:dirB])
@@ -1020,50 +1046,73 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
 
     " Large enough to be worth splitting further: recurse into every
     " common subdirectory (each one independently decides, from its
-    " own listing, whether to split again); common files/symlinks/type
-    " mismatches at this level become atomic leaf units directly.
+    " own listing, whether to split again); every other common entry
+    " (file, symlink, type mismatch) is covered by one shared per-level
+    " files-only unit, rather than one process per file -- a per-file
+    " job would both spawn-storm and bypass "diff"'s own "-x" excludes,
+    " which only apply when "diff" itself walks the directory.  The
+    " files-only unit also reports this level's one-sided entries, so
+    " they must not be synthesized here too.
+    let filesOnly = (!empty(onlyA) || !empty(onlyB))
     for name in common
         let pathA = a:dirA . s:sep . name
         let pathB = a:dirB . s:sep . name
         if get(entriesA, name, '') ==# 'dir' && get(entriesB, name, '') ==# 'dir'
             call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines)
         else
-            call add(a:units, [pathA, pathB])
+            let filesOnly = 1
         endif
     endfor
+    if filesOnly
+        call add(a:units, [a:dirA, a:dirB, 'no-r'])
+    endif
 endfunction
 
 " Fans the comparison out across the two directories' subtree, using
 " s:DirDiffCollectFanOutUnits() to decide, adaptively, how finely to
-" partition the work: a common subdirectory small enough stays a
-" single atomic "diff -r" job (the plugin's original, first-level-only
-" behaviour), but one large enough to dominate the whole run instead
-" gets split further so its own children can run as separate
-" concurrent jobs too -- this is what keeps a single huge common
-" subdirectory from becoming one serial straggler job while every
-" other (smaller) entry has long since finished.  Entries that only
-" exist on one side, at any depth of that walk, are resolved
-" immediately, without spawning anything, by synthesizing the same
-" "Only in ..." line that "diff --brief" itself would have produced.
-" The whole exploration below is synchronous and completes before any
-" job is queued, so the total job count is known up front exactly as
-" it was before this adaptive partitioning was introduced.
+" partition the work.  Work is split per SUBTREE, not per file: a
+" common subdirectory small enough stays a single atomic "diff -r"
+" job (the plugin's original, first-level-only behaviour), one large
+" enough to dominate the whole run is split further so its own
+" subdirectories can run as separate concurrent jobs too, and each
+" split level's remaining files are handled by a single files-only
+" unit (see s:DirDiffCollectFanOutUnits()) instead of one job per
+" file.  This keeps a single huge common subdirectory from becoming
+" one serial straggler job, without a spawn storm, and lets "diff"
+" itself apply the user's excludes to each level's entries (a per-file
+" job passing explicit file operands would not).  One-sided entries
+" with no unit of their own are resolved immediately, without spawning
+" anything, by synthesizing the same "Only in ..." line that "diff
+" --brief" itself would have produced.  The whole exploration below is
+" synchronous and completes before any job is queued, so the total job
+" count is known up front exactly as it was before this adaptive
+" partitioning was introduced.
 function! s:DirDiffDispatchFanOut(dirA, dirB, cmdarg, generation) abort
     let units = []
     let onlyLines = []
     call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines)
 
-    " Each unit gets its own job ("-r" in cmdarg makes diff recurse
-    " into it when it's a directory).  Units are queued one job per
-    " entry, rather than batched into a single shell invocation
-    " chaining several "diff" calls: cmd.exe, PowerShell and POSIX
-    " shells don't agree on an unconditional command separator, and
-    " "&&" would wrongly stop a batch early anyway on GNU diff's "exit
-    " code 1 = differences found".  One job per entry is the simplest
-    " option that's correct on every platform; concurrency is still
-    " bounded by g:DirDiffMaxJobs.
-    for [pathA, pathB] in units
-        let cmd = g:DirDiffLangString . "diff" . a:cmdarg . " \"" . pathA . "\" \"" . pathB . "\""
+    " Each unit gets its own job: atomic units ([pathA, pathB]) are
+    " "diff -r" over a whole subtree, while files-only units
+    " ([dirA, dirB, 'no-r']) are the same command with the leading " -r"
+    " dropped, so "diff" only looks at that one level.  Units are
+    " queued one job per entry, rather than batched into a single shell
+    " invocation chaining several "diff" calls: cmd.exe, PowerShell and
+    " POSIX shells don't agree on an unconditional command separator,
+    " and "&&" would wrongly stop a batch early anyway on GNU diff's
+    " "exit code 1 = differences found".  One job per entry is the
+    " simplest option that's correct on every platform; concurrency is
+    " still bounded by g:DirDiffMaxJobs.
+    for unit in units
+        let pathA = unit[0]
+        let pathB = unit[1]
+        let cmdarg = a:cmdarg
+        if get(unit, 2, '') ==# 'no-r'
+            " Drop the leading " -r " so this job compares just this
+            " level's own entries (top level only).
+            let cmdarg = substitute(a:cmdarg, '^ -r ', ' ', '')
+        endif
+        let cmd = g:DirDiffLangString . "diff" . cmdarg . " \"" . pathA . "\" \"" . pathB . "\""
         call s:DirDiffQueueJob(cmd, pathA, a:generation)
     endfor
 
