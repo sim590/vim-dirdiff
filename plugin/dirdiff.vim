@@ -95,18 +95,20 @@ if !exists("g:DirDiffForceShell")
     let g:DirDiffForceShell = ""
 endif
 
-" Run the diff command asynchronously via NeoVim's jobstart(), instead of
-" the classic blocking ":!cmd" call.  Defaults to on under NeoVim, and is
-" simply ignored (always synchronous) under classic Vim, which has no
-" equivalent async job API usable here.
+" Run the diff command asynchronously via a job API instead of the
+" classic blocking ":!cmd" call: NeoVim's jobstart(), or classic Vim's
+" job_start().  Defaults to on when such a job API plus the buffer
+" functions the streaming path needs (appendbufline()/setbufline(),
+" Vim 8.2.4257+) are available; otherwise the plugin stays fully
+" synchronous.  Set to 0 to force the classic synchronous path.
 if !exists("g:DirDiffAsync")
-    let g:DirDiffAsync = has('nvim')
+    let g:DirDiffAsync = has('nvim') || (has('job') && exists('*appendbufline'))
 endif
 " Maximum number of concurrent diff jobs to run when fanning the
 " comparison out across the top-level entries of the two directories
-" (NeoVim only).  Clamped to the range [1, 64] when actually used.  A
-" value of 1 (the default) just runs a single diff job asynchronously,
-" without any fan-out.
+" (async backends only).  Clamped to the range [1, 64] when actually
+" used.  A value of 1 (the default) just runs a single diff job
+" asynchronously, without any fan-out.
 if !exists("g:DirDiffMaxJobs")
     let g:DirDiffMaxJobs = 1
 endif
@@ -216,42 +218,135 @@ let s:DirDiffRedrawThrottleSec = 0.12
 " to that sentinel by s:DirDiffBuildSkeleton() at the start of every
 " run.
 let s:DirDiffLastRedrawTime = []
-" Minimal seam around jobstart()/jobstop() so the rest of the plugin
-" doesn't need to sprinkle has('nvim') checks everywhere.  Returns -1
-" when async execution isn't available/enabled, the same way callers
-" already treat a jobstart() failure.
+" Classic Vim: neither of the values job_start() hands back is the plain
+" positive-number job id the rest of the plugin passes around -- the Job
+" object can't be compared/hashed like one, and the Channel object it
+" gives the out/err callbacks isn't a Number either (E913 on ">").  So a
+" job's id is its channel id (ch_info().id, 0-based) plus one, which is
+" always > 0 and matches the Neovim contract; this map keeps the Job
+" object so s:JobStop() can still stop it (job_stop() wants the Job, not
+" a number).  Keyed the same way the callbacks can recompute it: out/err
+" receive the channel, exit_cb receives the Job.  Unused under Neovim.
+let s:DirDiffVimJobs = {}
+" Minimal seam around the editor's async job API so the rest of the
+" plugin doesn't need to sprinkle has('nvim') checks everywhere.
+" Returns -1 when async execution isn't available/enabled, the same way
+" callers already treat a failure to start a job.
 "
-" a:cmd is an argv List (never a shell string), so jobstart() execs it
+" a:cmd is an argv List (never a shell string), so the job API execs it
 " directly without any shell: g:DirDiffForceShell, which only ever
 " affected the synchronous "!" path's shell, no longer applies to async
-" jobs.  The forced LANG is passed through the job's 'env' option
-" rather than a "LANG=..." shell prefix, so it no longer depends on the
-" user's shell at all.
+" jobs.  The forced LANG is passed through the job's 'env' option rather
+" than a "LANG=..." shell prefix, so it no longer depends on the user's
+" shell at all.
+"
+" The backend is picked by editor: NeoVim uses jobstart() with a
+" callbacks dict; classic Vim uses job_start() with adapted callbacks
+" (see the s:VimJob*Cb() adapters below) and a channel-derived id, which
+" s:JobStop() and every downstream consumer already work with.
+function! s:DirDiffAsyncAvailable() abort
+    " appendbufline()/setbufline() (Vim 8.2.4257+) are needed by the
+    " streaming path; the 'env' job option is older, so gating on these
+    " covers it too.
+    return has('nvim') || (has('job') && exists('*appendbufline'))
+endfunction
+
 function! s:JobStart(cmd, callbacks) abort
-    if !g:DirDiffAsync || !has('nvim')
+    if !g:DirDiffAsync || !s:DirDiffAsyncAvailable()
         return -1
     endif
-    " jobstart() can throw synchronously (eg. the executable doesn't
-    " exist); guard it and fold that failure into the same "-1 = could
-    " not start" contract the rest of the plugin already handles.  The
-    " callbacks dict is copied (extend() mutates its first argument) so
-    " adding 'env' never touches the caller's dict.
-    let jobId = -1
-    try
-        if g:DirDiffForceLang != ""
-            let jobId = jobstart(a:cmd, extend(copy(a:callbacks), {'env': {'LANG': g:DirDiffForceLang}}))
-        else
-            let jobId = jobstart(a:cmd, a:callbacks)
-        endif
-    catch
+
+    " --- NeoVim: jobstart() with a callbacks dict ---
+    if has('nvim')
+        " jobstart() can throw synchronously (eg. the executable doesn't
+        " exist); guard it and fold that failure into the same "-1 =
+        " could not start" contract the rest of the plugin already
+        " handles.  The callbacks dict is copied (extend() mutates its
+        " first argument) so adding 'env' never touches the caller's.
         let jobId = -1
+        try
+            if g:DirDiffForceLang != ""
+                let jobId = jobstart(a:cmd, extend(copy(a:callbacks), {'env': {'LANG': g:DirDiffForceLang}}))
+            else
+                let jobId = jobstart(a:cmd, a:callbacks)
+            endif
+        catch
+            let jobId = -1
+        endtry
+        return jobId
+    endif
+
+    " --- Classic Vim: job_start() with its own callback signatures ---
+    let opts = {}
+    if has_key(a:callbacks, 'on_stdout')
+        let opts.out_cb = function('s:VimJobOutCb', [a:callbacks.on_stdout])
+    endif
+    if has_key(a:callbacks, 'on_stderr')
+        let opts.err_cb = function('s:VimJobErrCb', [a:callbacks.on_stderr])
+    endif
+    if has_key(a:callbacks, 'on_exit')
+        let opts.exit_cb = function('s:VimJobExitCb', [a:callbacks.on_exit])
+    endif
+    if g:DirDiffForceLang != ""
+        let opts.env = {'LANG': g:DirDiffForceLang}
+    endif
+    " job_start() can throw, and can also return a job that immediately
+    " reports "fail" when the command couldn't be executed; both are
+    " folded into the same -1 contract.  The channel-derived id (see
+    " s:DirDiffVimJobs) is what every downstream consumer (active-jobs
+    " list, stderr dict, s:JobStop(), the timeout timer) expects.
+    try
+        let job = job_start(a:cmd, opts)
+    catch
+        return -1
     endtry
+    if job_status(job) ==# 'fail'
+        return -1
+    endif
+    let jobId = ch_info(job_getchannel(job)).id + 1
+    let s:DirDiffVimJobs[jobId] = job
     return jobId
+endfunction
+
+" Adapters translating classic Vim's job_start() callback signatures
+" into the NeoVim-shaped ones the rest of the plugin uses.
+"
+" Vim passes the channel as the first callback argument (NeoVim passes
+" the job id), and with the default "NL" channel mode each out/err
+" callback delivers exactly one message: the complete line, with its
+" trailing NL stripped (and any final newline-less line is still given
+" as one last message before exit).  That maps onto NeoVim's data-list
+" contract as [line, '']: the trailing '' is the "empty partial
+" remainder" on_stdout expects, so the line is emitted immediately.
+"
+" exit_cb instead gets the Job object; its channel id (recovered from
+" the job) recomputes the same id s:JobStart() returned.  The job is
+" dropped from s:DirDiffVimJobs here (a clean exit needs no stopping).
+function! s:VimJobOutCb(on_stdout, channel, msg) abort
+    call a:on_stdout(ch_info(a:channel).id + 1, [a:msg, ''], 'stdout')
+endfunction
+
+function! s:VimJobErrCb(on_stderr, channel, msg) abort
+    call a:on_stderr(ch_info(a:channel).id + 1, [a:msg, ''], 'stderr')
+endfunction
+
+function! s:VimJobExitCb(on_exit, job, status) abort
+    let jobId = ch_info(job_getchannel(a:job)).id + 1
+    if has_key(s:DirDiffVimJobs, jobId)
+        call remove(s:DirDiffVimJobs, jobId)
+    endif
+    call a:on_exit(jobId, a:status, 'exit')
 endfunction
 
 function! s:JobStop(id) abort
     if a:id > 0
-        silent! call jobstop(a:id)
+        if has('nvim')
+            silent! call jobstop(a:id)
+        elseif has_key(s:DirDiffVimJobs, a:id)
+            " job_stop() wants the Job object here (a bare channel number
+            " is rejected with E475 on this Vim).
+            silent! call job_stop(s:DirDiffVimJobs[a:id])
+        endif
     endif
 endfunction
 
@@ -340,7 +435,7 @@ function! <SID>DirDiff(srcA, srcB)
     " Constructs the diff command-line arguments
     let cmdarg = s:BuildDiffCmdArg()
 
-    if (!g:DirDiffAsync || !has('nvim'))
+    if (!g:DirDiffAsync || !s:DirDiffAsyncAvailable())
         " ---- Classic, fully synchronous path (identical behaviour to
         " before async support was added) ----
         let cmd = "!" . g:DirDiffLangString . "diff" . cmdarg . " \"".DirDiffAbsSrcA."\" \"".DirDiffAbsSrcB."\""
@@ -357,7 +452,7 @@ function! <SID>DirDiff(srcA, srcB)
         return
     endif
 
-    " ---- Asynchronous path (NeoVim only) ----
+    " ---- Asynchronous path (NeoVim jobstart() or Vim job_start()) ----
     let s:DirDiffJobQueue = []
     let s:DirDiffActiveJobs = []
     let s:DirDiffJobsTotal = 0
@@ -395,7 +490,7 @@ function! <SID>DirDiff(srcA, srcB)
         " entries of both directories so several diff jobs can run
         " concurrently; "only in" entries are shown immediately, and
         " each sub-job's own output streams in the same way as above.
-        call s:DirDiffDispatchFanOut(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg, myGeneration)
+        call s:DirDiffDispatchFanOut(DirDiffAbsSrcA, DirDiffAbsSrcB, myGeneration)
     endif
 endfunction
 
@@ -429,8 +524,8 @@ endfunction
 
 " Argv-List equivalent of s:BuildDiffCmdArg() above: same options in the
 " same order, but returned as a List of individual "diff" arguments
-" instead of one shell string.  Used to launch async jobs (NeoVim
-" jobstart(), and later classic Vim's job_start) without going through a
+" instead of one shell string.  Used to launch async jobs (NeoVim's
+" jobstart(), or classic Vim's job_start()) without going through a
 " shell, so paths and patterns containing spaces, quotes or non-ASCII
 " bytes need no quoting.  Must be kept in sync with s:BuildDiffCmdArg().
 function! s:BuildDiffCmdArgList() abort
@@ -648,6 +743,13 @@ function! s:DirDiffBuildSkeleton(dirA, dirB, cmdarg) abort
     call s:DirDiffApplyUIChrome()
 endfunction
 
+" Portable buffer line count: nvim_buf_line_count() is NeoVim-only, so
+" go through getbufinfo() instead (available in both editors, and the
+" async gate already requires appendbufline()/setbufline()).
+function! s:DirDiffBufLineCount(bufnr) abort
+    return getbufinfo(a:bufnr)[0].linecount
+endfunction
+
 " Inserts newly-arrived diff result lines (already transformed via
 " s:DirDiffTransformLine()) into the live async streaming buffer,
 " right above the trailing progress line, and refreshes that progress
@@ -680,7 +782,7 @@ function! s:DirDiffStreamAppend(lines) abort
         " arrival order -- no full re-sort/rebuild happens here, see
         " s:DirDiffFinishStreaming() for the single sort pass done
         " once every job is done.
-        call appendbufline(s:DirDiffStatusBufNr, nvim_buf_line_count(s:DirDiffStatusBufNr) - 1, a:lines)
+        call appendbufline(s:DirDiffStatusBufNr, s:DirDiffBufLineCount(s:DirDiffStatusBufNr) - 1, a:lines)
     endif
     call setbufline(s:DirDiffStatusBufNr, '$', s:DirDiffProgressText())
     call setbufvar(s:DirDiffStatusBufNr, '&modifiable', 0)
@@ -1124,7 +1226,7 @@ endfunction
 " synchronous and completes before any job is queued, so the total job
 " count is known up front exactly as it was before this adaptive
 " partitioning was introduced.
-function! s:DirDiffDispatchFanOut(dirA, dirB, cmdarg, generation) abort
+function! s:DirDiffDispatchFanOut(dirA, dirB, generation) abort
     let units = []
     let onlyLines = []
     call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines)
