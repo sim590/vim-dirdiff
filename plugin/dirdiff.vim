@@ -1330,7 +1330,7 @@ endfunction
 " this function at all in that case.
 function! s:DirDiffNameMatchesInclude(relPath, includeRegexes) abort
     for regex in a:includeRegexes
-        if match(a:relPath, regex) >= 0
+        if a:relPath =~# regex
             return 1
         endif
     endfor
@@ -1359,8 +1359,7 @@ endfunction
 " The default, non-include path leaves exclusion entirely to "diff".
 function! s:DirDiffIsExcluded(name, excludesRegexes) abort
     for regex in a:excludesRegexes
-        let re = g:DirDiffIgnoreFileNameCase ? '\c' . regex : regex
-        if match(a:name, re) >= 0
+        if g:DirDiffIgnoreFileNameCase ? a:name =~? regex : a:name =~# regex
             return 1
         endif
     endfor
