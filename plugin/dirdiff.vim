@@ -179,6 +179,11 @@ let s:DirDiffGeneration = 0
 let s:DirDiffActiveJobs = []
 " Pending work items, each a {'cmd', 'desc', 'generation'} dict.
 let s:DirDiffJobQueue = []
+" Accumulated stderr text per job id, keyed by job id; populated by each
+" job's on_stderr callback so s:DirDiffOnJobExit() can surface diff's
+" diagnostics (which otherwise never reach the user, only the exit
+" code does).
+let s:DirDiffJobStderr = {}
 " Progress counters, also used to know when every job is done.
 let s:DirDiffJobsTotal = 0
 let s:DirDiffJobsDone = 0
@@ -770,7 +775,7 @@ function! s:DirDiffPumpQueue(generation) abort
         let pending = ['']
         let OnStdout = function('s:DirDiffOnJobStdout', [a:generation, pending])
         let OnExit = function('s:DirDiffOnJobExit', [a:generation, pending, work.desc])
-        let jobId = s:JobStart(work.cmd, {'on_stdout': OnStdout, 'on_exit': OnExit})
+        let jobId = s:JobStart(work.cmd, {'on_stdout': OnStdout, 'on_stderr': function('s:DirDiffOnJobStderr'), 'on_exit': OnExit})
         if jobId > 0
             call add(s:DirDiffActiveJobs, jobId)
             if g:DirDiffJobTimeout > 0
@@ -818,6 +823,20 @@ function! s:DirDiffOnJobStdout(generation, pending, job_id, data, event) abort
     endif
 endfunction
 
+" on_stderr callback for every diff job.  NeoVim appends (job_id, data,
+" event) when invoking it, "data" being a List of strings chunked just
+" like on_stdout's.  The chunks are simply joined and accumulated per
+" job id in s:DirDiffJobStderr so s:DirDiffOnJobExit() can surface
+" diff's diagnostics, which otherwise never reach the user (only the
+" exit code does today).
+function! s:DirDiffOnJobStderr(job_id, data, event) abort
+    let text = join(a:data, "\n")
+    if text == ''
+        return
+    endif
+    let s:DirDiffJobStderr[a:job_id] = get(s:DirDiffJobStderr, a:job_id, '') . text
+endfunction
+
 " Common on_exit handler for every diff job, whether it's the single
 " async job (no fan-out) or part of a fan-out batch.  Bound via
 " function(name, arglist) with (generation, pending, desc) pre-filled,
@@ -846,10 +865,17 @@ function! s:DirDiffOnJobExit(generation, pending, desc, job_id, data, event) abo
 
     " GNU diff: 0 = identical, 1 = differences found, >=2 = a real error
     " (eg. permission denied, path not found).  Surface errors instead of
-    " silently swallowing them.
+    " silently swallowing them, including a truncated snippet of whatever
+    " diff wrote to stderr (see s:DirDiffOnJobStderr()).
+    let stderrLines = split(substitute(get(s:DirDiffJobStderr, a:job_id, ''), '\r', '', 'g'), "\n")
     if a:data != 0 && a:data != 1
-        call add(lines, "[ERROR] could not compare: " . a:desc . " (code " . a:data . ")")
+        let errLine = "[ERROR] could not compare: " . a:desc . " (code " . a:data . ")"
+        if !empty(stderrLines)
+            let errLine = errLine . ": " . strpart(stderrLines[0], 0, 200)
+        endif
+        call add(lines, errLine)
     endif
+    call remove(s:DirDiffJobStderr, a:job_id)
 
     let s:DirDiffJobsDone = s:DirDiffJobsDone + 1
 
