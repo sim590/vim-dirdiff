@@ -128,6 +128,33 @@ endif
 if !exists("g:DirDiffFanOutThreshold")
     let g:DirDiffFanOutThreshold = 0
 endif
+" Optional glob-style include pattern (or several, separated by ','
+" with no space, same convention as g:DirDiffExcludes/g:DirDiffIgnore)
+" restricting the comparison to only the FILE entries whose RELATIVE
+" PATH -- accumulated with "/" as the separator from the root of the
+" two directories being compared, regardless of platform -- matches at
+" least one of the patterns.  A simple pattern with no path separator
+" (eg. "*.xml") behaves exactly as if it only mattered against a base
+" name: glob2regpat() leaves such a pattern unanchored at the start, so
+" it still matches anywhere in the tree, same as before relative paths
+" were introduced.  A pattern with a path component (eg.
+" "subdir/*.xml", or "subdir\*.xml" -- backslashes are normalized to
+" "/" automatically, see s:DirDiffBuildIncludeRegexes()) instead scopes
+" the match to that specific subdirectory, since glob2regpat() anchors
+" such a pattern at the start ("^subdir/").  Empty (the default) means
+" no filtering at all -- strictly the same behaviour as before this
+" variable was introduced.  Unlike g:DirDiffExcludes/g:DirDiffAddArgs,
+" this is NOT passed down to the "diff" binary (GNU diff has no
+" "include-only" flag, only "-x" for exclusion); it's instead applied
+" by our own fan-out enumeration (see s:DirDiffCollectFanOutUnits()) so
+" that a non-matching file never even gets a job queued for it.  Only
+" ever consulted on the asynchronous path (including classic Vim's
+" job_start()); the classic fully-synchronous path has no per-file job
+" queue to filter and so does not honour this setting (see
+" <SID>DirDiff()).
+if !exists("g:DirDiffIncludePattern")
+    let g:DirDiffIncludePattern = ""
+endif
 
 let g:DirDiffLangString = ""
 if (g:DirDiffForceLang != "")
@@ -189,6 +216,12 @@ let s:DirDiffJobStderr = {}
 " Progress counters, also used to know when every job is done.
 let s:DirDiffJobsTotal = 0
 let s:DirDiffJobsDone = 0
+" Number of entries the include pattern made the enumeration skip (see
+" g:DirDiffIncludePattern): they matched neither by name nor as a
+" structural one-sided directory.  Reported when the run ends up with
+" nothing to show, so the empty result can be told apart from a genuine
+" "the trees are identical" outcome.  Reset at the start of every run.
+let s:DirDiffHiddenCount = 0
 " Context shared by the queue pump and the job callbacks; set once per
 " DirDiff() invocation, before any job is started.
 let s:DirDiffJobMaxJobs = 1
@@ -467,6 +500,7 @@ function! <SID>DirDiff(srcA, srcB)
     let s:DirDiffActiveJobs = []
     let s:DirDiffJobsTotal = 0
     let s:DirDiffJobsDone = 0
+    let s:DirDiffHiddenCount = 0
     let s:DirDiffStreaming = 1
     let s:DirDiffJobDirA = DirDiffAbsSrcA
     let s:DirDiffJobDirB = DirDiffAbsSrcB
@@ -482,7 +516,7 @@ function! <SID>DirDiff(srcA, srcB)
     " concurrently; it never affects how promptly results show up.
     call s:DirDiffBuildSkeleton(DirDiffAbsSrcA, DirDiffAbsSrcB, cmdarg)
 
-    if (s:DirDiffJobMaxJobs <= 1 || !isdirectory(DirDiffAbsSrcA) || !isdirectory(DirDiffAbsSrcB))
+    if ((s:DirDiffJobMaxJobs <= 1 && g:DirDiffIncludePattern == "") || !isdirectory(DirDiffAbsSrcA) || !isdirectory(DirDiffAbsSrcB))
         " No fan-out: a single job runs the whole comparison (still
         " "-r" recursive over the entire tree being compared), just
         " non-blocking, with its stdout streamed into the skeleton
@@ -492,6 +526,14 @@ function! <SID>DirDiff(srcA, srcB)
         " a bad path (NeoVim's readdir() returns [] rather than
         " erroring) and flood the buffer with bogus "Only in" entries,
         " whereas the single job lets diff itself fail and report.
+        " Note this branch is NOT taken when g:DirDiffIncludePattern is
+        " set (and both sources are directories): a single monolithic
+        " "diff -r" job has no way to leave out individual files by
+        " name, so an active include pattern always routes through the
+        " fan-out/collection machinery below, even when
+        " g:DirDiffMaxJobs is 1 -- the resulting queue then just runs
+        " one filtered job at a time instead of one unfiltered job
+        " covering everything.
         let argv = ['diff'] + s:DirDiffJobCmdArgList + [DirDiffAbsSrcA, DirDiffAbsSrcB]
         call s:DirDiffQueueJob(argv, DirDiffAbsSrcA." <-> ".DirDiffAbsSrcB, myGeneration)
         let s:DirDiffJobsTotal = 1
@@ -598,6 +640,7 @@ function! s:DirDiffApplyUIChrome() abort
     nnoremap <buffer> x :call <SID>ChangeExcludes()<CR>
     nnoremap <buffer> a :call <SID>ChangeArguments()<CR>
     nnoremap <buffer> i :call <SID>ChangeIgnore()<CR>
+    nnoremap <buffer> f :call <SID>ChangeIncludePattern()<CR>
     nnoremap <buffer> h :call <SID>DirDiffHexmode()<CR>
     nnoremap <buffer> w :call <SID>DirDiffWrapmode()<CR>
     nnoremap <buffer> q :call <SID>DirDiffQuit()<CR>
@@ -698,7 +741,7 @@ function! s:DirDiffFinalize(resultLines, dirDiffAbsSrcA, dirDiffAbsSrcB, cmdarg)
     else
         call append(2, "Usage:   <Enter>/'o'=open,'s'=sync,'q'=quit")
     endif
-    call append(3, "Options: 'u'=update,'x'=set excludes,'i'=set ignore,'a'=set args, 'h'=hex mode, 'w'=wrap mode")
+    call append(3, "Options: 'u'=update,'x'=set excludes,'i'=set ignore,'a'=set args,'f'=set file pattern, 'h'=hex mode, 'w'=wrap mode")
     call append(4, "Diff Args:" . a:cmdarg)
     call append(5, "")
     " go to the beginning of the file
@@ -738,7 +781,7 @@ function! s:DirDiffBuildSkeleton(dirA, dirB, cmdarg) abort
     else
         call add(headerLines, "Usage:   <Enter>/'o'=open,'s'=sync,'q'=quit")
     endif
-    call add(headerLines, "Options: 'u'=update,'x'=set excludes,'i'=set ignore,'a'=set args, 'h'=hex mode, 'w'=wrap mode")
+    call add(headerLines, "Options: 'u'=update,'x'=set excludes,'i'=set ignore,'a'=set args,'f'=set file pattern, 'h'=hex mode, 'w'=wrap mode")
     call add(headerLines, "Diff Args:" . a:cmdarg)
     call add(headerLines, "")
 
@@ -1248,10 +1291,51 @@ function! s:DirDiffListDirTyped(path) abort
     return result
 endfunction
 
+" Turns g:DirDiffIncludePattern into a List of Vim regex patterns ready
+" for match(), one per comma-separated glob sub-pattern (eg.
+" "*.xml,*.log" becomes two separate regexes), using the native
+" glob2regpat() to do the glob-to-regex conversion.  Each sub-pattern
+" has its backslashes normalized to forward slashes first (eg. a
+" Windows-style "subdir\*.xml" typed by the user becomes
+" "subdir/*.xml"), so that it matches identically regardless of which
+" path separator the user typed -- the relative path it's eventually
+" matched against (see s:DirDiffCollectFanOutUnits()) is itself always
+" built with "/" internally, regardless of platform.  Returns an empty
+" List when g:DirDiffIncludePattern is "" (the default); that empty
+" List doubles as the "no filtering active at all" sentinel checked by
+" every caller below via empty(), so every caller plumbing this down
+" keeps working unmodified when the feature is unused.
+function! s:DirDiffBuildIncludeRegexes() abort
+    if g:DirDiffIncludePattern == ""
+        return []
+    endif
+    let patterns = map(split(g:DirDiffIncludePattern, ','), 'substitute(v:val, ''\\'', ''/'', ''g'')')
+    return map(patterns, 'glob2regpat(v:val)')
+endfunction
+
+" Returns truthy when "relPath" (a file's path relative to the root of
+" the two directories being compared, always "/"-separated internally
+" -- see s:DirDiffCollectFanOutUnits()) matches at least one of the
+" regexes built by s:DirDiffBuildIncludeRegexes() (OR semantics across
+" comma-separated patterns, same as the existing multiple "-x" exclude
+" flags).  Only meaningful when a:includeRegexes is non-empty; callers
+" are expected to check empty(a:includeRegexes) themselves first
+" (meaning "no filter active, include everything") rather than call
+" this function at all in that case.
+function! s:DirDiffNameMatchesInclude(relPath, includeRegexes) abort
+    for regex in a:includeRegexes
+        if match(a:relPath, regex) >= 0
+            return 1
+        endif
+    endfor
+    return 0
+endfunction
+
 " Recursively walks dirA/dirB deciding how to partition the comparison
 " so it can fan out across several concurrent jobs while staying
-" correct and avoiding a spawn storm:
+" correct and avoiding a spawn storm.
 "
+" Default, no include pattern (a:includeRegexes empty):
 "  - the whole subtree becomes one atomic "diff -r" job when it has few
 "    enough common entries (the plugin's original behaviour);
 "  - otherwise it splits per SUBTREE: each common subdirectory (both
@@ -1274,22 +1358,60 @@ endfunction
 " the probe budget or max depth is exhausted -- this NEVER produces
 " worse parallelism than the original single-level fan-out.
 "
+" With an include pattern active (non-empty a:includeRegexes) neither
+" the atomic "diff -r" shortcut nor the files-only unit may be used:
+" either would compare (and report) files that do not match, since
+" "diff" is never told about the pattern.  Instead every common file
+" becomes its own per-file job when its relative path matches,
+" non-matching entries are silently skipped and counted in a:hidden,
+" common subdirectories are always walked down to the files (bounded by
+" the same probe budget/depth caps), and one-sided entries are either
+" synthesized here (their matching files) or hidden (the rest,
+" including one-sided directories).  If the probe budget or depth cap
+" is hit while an include pattern is active, the remaining subtree
+" still collapses to one atomic "diff -r" job whose output is NOT
+" filtered -- an accepted edge case: the safety guards against a
+" pathological tree take precedence over filtering fidelity there.
+"
 " a:units: List of units to append to; each is either [pathA, pathB]
 "          (an atomic "diff -r" job) or [dirA, dirB, 'no-r'] (a
-"          files-only unit covering one directory level).
+"          files-only unit covering one directory level).  The 'no-r'
+"          form is never produced while an include pattern is active.
 " a:onlyLines: List of raw "Only in ..." strings to append to; these
 "          need no job, exactly like the original immediate-entries
 "          handling.
 " a:probeBudget: single-element List (mutable counter shared across the
 "          whole recursive walk) decremented once per directory listing
 "          actually performed, bounding total round trips globally.
+" a:includeRegexes: List of regexes from s:DirDiffBuildIncludeRegexes();
+"          empty means "no filtering", the default, strictly unchanged
+"          behaviour.
+" a:relPath: path of (a:dirA, a:dirB) relative to the root passed to
+"          s:DirDiffDispatchFanOut(), accumulated one "name" component
+"          at a time and always joined with "/", regardless of platform
+"          -- a purely virtual construction used only to match against
+"          a:includeRegexes, never a real file-system path.  "" at the
+"          root.
+" a:hidden: single-element List (mutable counter, like a:probeBudget)
+"          accumulating the number of entries skipped because they did
+"          not match the include pattern (or because a one-sided
+"          directory is structural); surfaced by
+"          s:DirDiffFinishStreaming() when the run ends up empty.
 "
 " Does not follow symlinks into directories (matches "diff -r"'s own
 " default behaviour, and avoids infinite recursion on symlink cycles):
 " an entry only recurses further when BOTH sides report type == 'dir'
 " exactly.
-function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines) abort
+function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines, includeRegexes, relPath, hidden) abort
     if a:probeBudget[0] <= 0 || a:depth >= s:DirDiffFanOutMaxDepth
+        " Safety cap reached: fall back to one atomic "diff -r" job for
+        " the whole remaining subtree.  NOTE: when an include pattern is
+        " active this job's output is NOT filtered -- the pattern only
+        " ever prevents *queuing* a per-file job, it is never passed
+        " down to "diff" itself -- so non-matching entries inside this
+        " subtree still show up.  Accepted edge case: these guards exist
+        " to keep a pathological tree from stalling the up-front walk,
+        " and they take precedence over filtering fidelity here.
         call add(a:units, [a:dirA, a:dirB])
         return
     endif
@@ -1301,6 +1423,55 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
     let onlyA = filter(keys(entriesA), '!has_key(entriesB, v:val)')
     let onlyB = filter(keys(entriesB), '!has_key(entriesA, v:val)')
     let common = filter(keys(entriesA), 'has_key(entriesB, v:val)')
+
+    if !empty(a:includeRegexes)
+        " ---- include pattern active (see the header comment) ----
+        " One-sided entries are synthesized right here, since the
+        " files-only unit that would normally report them is never
+        " created on this path.
+        for name in onlyA
+            if get(entriesA, name, '') ==# 'dir'
+                " A one-sided directory carries no file name to match
+                " against; the pattern hides it.
+                let a:hidden[0] += 1
+            elseif s:DirDiffNameMatchesInclude(empty(a:relPath) ? name : a:relPath . '/' . name, a:includeRegexes)
+                call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirA . s:DirDiffDiffOnlyLineCenter . name)
+            else
+                let a:hidden[0] += 1
+            endif
+        endfor
+        for name in onlyB
+            if get(entriesB, name, '') ==# 'dir'
+                let a:hidden[0] += 1
+            elseif s:DirDiffNameMatchesInclude(empty(a:relPath) ? name : a:relPath . '/' . name, a:includeRegexes)
+                call add(a:onlyLines, s:DirDiffDiffOnlyLine . a:dirB . s:DirDiffDiffOnlyLineCenter . name)
+            else
+                let a:hidden[0] += 1
+            endif
+        endfor
+
+        if empty(common)
+            return
+        endif
+
+        " Common subdirectories are walked (however few entries they
+        " appear to hold); every other common entry (file, symlink,
+        " type mismatch) is compared by its own per-file job when its
+        " relative path matches, and skipped otherwise.
+        for name in common
+            let pathA = a:dirA . s:sep . name
+            let pathB = a:dirB . s:sep . name
+            let childRelPath = empty(a:relPath) ? name : a:relPath . '/' . name
+            if get(entriesA, name, '') ==# 'dir' && get(entriesB, name, '') ==# 'dir'
+                call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes, childRelPath, a:hidden)
+            elseif s:DirDiffNameMatchesInclude(childRelPath, a:includeRegexes)
+                call add(a:units, [pathA, pathB])
+            else
+                let a:hidden[0] += 1
+            endif
+        endfor
+        return
+    endif
 
     if empty(common)
         " Nothing in common: no job will look at this directory at all
@@ -1340,7 +1511,7 @@ function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onl
         let pathA = a:dirA . s:sep . name
         let pathB = a:dirB . s:sep . name
         if get(entriesA, name, '') ==# 'dir' && get(entriesB, name, '') ==# 'dir'
-            call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines)
+            call s:DirDiffCollectFanOutUnits(pathA, pathB, a:depth + 1, a:probeBudget, a:units, a:onlyLines, a:includeRegexes, a:relPath, a:hidden)
         else
             let filesOnly = 1
         endif
@@ -1369,10 +1540,22 @@ endfunction
 " synchronous and completes before any job is queued, so the total job
 " count is known up front exactly as it was before this adaptive
 " partitioning was introduced.
+"
+" With g:DirDiffIncludePattern set, s:DirDiffCollectFanOutUnits() takes
+" a different, per-file partitioning (see its own comment): only the
+" matching files ever get a job queued for them, so the "total job count
+" known up front" statement above still holds, just over the reduced
+" set.
 function! s:DirDiffDispatchFanOut(dirA, dirB, generation) abort
     let units = []
     let onlyLines = []
-    call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines)
+    let includeRegexes = s:DirDiffBuildIncludeRegexes()
+    let hidden = [0]
+    call s:DirDiffCollectFanOutUnits(a:dirA, a:dirB, 0, [s:DirDiffFanOutProbeBudget], units, onlyLines, includeRegexes, '', hidden)
+    " Remember how many entries the include pattern made the walk skip,
+    " for s:DirDiffFinishStreaming()'s "nothing to show" message.  Zero
+    " whenever no pattern is active.
+    let s:DirDiffHiddenCount = hidden[0]
 
     " Each unit gets its own job: atomic units ([pathA, pathB]) are
     " "diff -r" over a whole subtree, while files-only units
@@ -2092,6 +2275,16 @@ endfunction
 " Let you modify the Ignore patthern
 function! <SID>ChangeIgnore()
     let g:DirDiffIgnore = input ("Ignore pattern (separate multiple patterns with ','): ", g:DirDiffIgnore)
+    echo "\nPress update ('u') to refresh the diff."
+endfunction
+
+" Let you modify the file include pattern (asynchronous path only --
+" see g:DirDiffIncludePattern's own definition above).  The pattern may
+" include a path prefix to scope it to a specific subdirectory (eg.
+" "subdir/*.xml" or "subdir\*.xml", both equivalent); a plain pattern
+" with no path separator still matches anywhere in the tree as before.
+function! <SID>ChangeIncludePattern()
+    let g:DirDiffIncludePattern = input ("File include pattern, optionally with a path prefix like 'subdir/*.xml' (separate multiple patterns with ','): ", g:DirDiffIncludePattern)
     echo "\nPress update ('u') to refresh the diff."
 endfunction
 
