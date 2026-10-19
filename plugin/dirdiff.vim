@@ -1467,6 +1467,16 @@ function! <SID>GotoDiffWindow()
     call <SID>Drop(s:FilenameDiffWindow)
 endfunction
 
+" Unloading a buffer that is displayed in a window closes that window,
+" so only unload the previous file when it is not the one just (re)opened
+" -- which happens when DirDiffNext() reopens the same pair automatically,
+" eg. right after :DirDiffUpdate rebuilt the (new) list buffer.
+function! <SID>DirDiffUnloadPrevious(previous, current) abort
+    if a:previous != "" && a:previous !=# a:current
+        silent exec "bd ".bufnr(a:previous)
+    endif
+endfunction
+
 function! <SID>DirDiffOpen()
     " Ensure we're in the right window
     call <SID>GotoDiffWindow()
@@ -1515,7 +1525,7 @@ function! <SID>DirDiffOpen()
                 let previousFile = (s:LastMode == "A") ? previousFileA : previousFileB
                 call <SID>Drop(previousFile)
                 silent exec "edit ".fileToOpen
-                silent exec "bd ".bufnr(previousFile)
+                call <SID>DirDiffUnloadPrevious(previousFile, fileToOpen)
             endif
         else
             silent exec "split ".fileToOpen
@@ -1535,17 +1545,17 @@ function! <SID>DirDiffOpen()
                 call <SID>Drop(previousFileA)
                 silent exec "edit ".s:FilenameA
                 diffthis
-                silent exec "bd ".bufnr(previousFileA)
+                call <SID>DirDiffUnloadPrevious(previousFileA, s:FilenameA)
 
                 call <SID>Drop(previousFileB)
                 silent exec "edit ".s:FilenameB
                 diffthis
-                silent exec "bd ".bufnr(previousFileB)
+                call <SID>DirDiffUnloadPrevious(previousFileB, s:FilenameB)
             else
                 let previousFile = (s:LastMode == "A") ? previousFileA : previousFileB
                 call <SID>Drop(previousFile)
                 silent exec "edit ".s:FilenameB
-                silent exec "bd ".bufnr(previousFile)
+                call <SID>DirDiffUnloadPrevious(previousFile, s:FilenameB)
                 diffthis
 
                 " To ensure that A is on the left and B on the right, splitright must be off
