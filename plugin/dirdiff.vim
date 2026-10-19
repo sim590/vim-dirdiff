@@ -826,10 +826,65 @@ function! s:DirDiffStreamAppend(lines) abort
     endif
     let s:DirDiffLastRedrawTime = reltime()
 
+    " Only refresh the visible screen when the DirDiff window is in the
+    " current tab page: otherwise the user is looking somewhere else, and
+    " both switching tabs and (worse) the <SID>Drop() fallback :edit'ing
+    " the list buffer into their own window would be very intrusive.  The
+    " result buffer itself is already updated by number above.
+    if bufwinid(s:DirDiffStatusBufNr) <= 0
+        return
+    endif
+
     let savedWin = win_getid()
     call <SID>GotoDiffWindow()
     call win_gotoid(savedWin)
     redraw
+endfunction
+
+" Message used when a run completes with no entry to display; kept in
+" one function so the on-screen and background finalize paths agree.
+function! s:DirDiffNoDiffMessage() abort
+    return "diff found no differences"
+endfunction
+
+" Finalize the result buffer when its window is not in the current tab
+" page (the user switched away during a long run).  Everything is done by
+" buffer number: no window is entered, no tab is switched, and the first
+" diff is not auto-opened -- that only makes sense while on screen.
+function! s:DirDiffFinishStreamingBackground(bufNr) abort
+    " Strip the "==> " marker left on the entry opened while streaming,
+    " before the sort below (same reason as the visible path).
+    let curDiff = getbufvar(a:bufNr, 'currentDiff', 0)
+    if curDiff > 0
+        let curLine = getbufline(a:bufNr, curDiff)
+        if !empty(curLine) && curLine[0] =~# '^==> '
+            call setbufline(a:bufNr, curDiff, substitute(curLine[0], '^==> ', '    ', ''))
+        endif
+    endif
+
+    " The trailing progress line has done its job; every job is done.
+    call setbufvar(a:bufNr, '&modifiable', 1)
+    call deletebufline(a:bufNr, s:DirDiffBufLineCount(a:bufNr))
+    call setbufvar(a:bufNr, '&modifiable', 0)
+    call setbufvar(a:bufNr, '&modified', 0)
+
+    if s:DirDiffBufLineCount(a:bufNr) <= s:DirDiffFirstDiffLine
+        " Nothing was ever streamed in: same cleanup/message as the
+        " visible path, without touching any window.
+        silent! execute "bwipeout! " . a:bufNr
+        let s:DirDiffStatusBufNr = -1
+        echom s:DirDiffNoDiffMessage() . " - directories match."
+        return
+    endif
+
+    if (g:DirDiffSort == 1)
+        let lines = getbufline(a:bufNr, s:DirDiffFirstDiffLine + 1, '$')
+        call sort(lines, 's:Strcmp')
+        call setbufvar(a:bufNr, '&modifiable', 1)
+        call setbufline(a:bufNr, s:DirDiffFirstDiffLine + 1, lines)
+        call setbufvar(a:bufNr, '&modifiable', 0)
+        call setbufvar(a:bufNr, '&modified', 0)
+    endif
 endfunction
 
 " Called once every queued job (and the immediate "only in" entries,
@@ -844,6 +899,17 @@ function! s:DirDiffFinishStreaming() abort
     endif
     let bufNr = s:DirDiffStatusBufNr
     let s:DirDiffStreaming = 0
+
+    " bufwinid() only searches the current tab page.  When the user
+    " switched to another tab while a long run was streaming, finalize the
+    " buffer in place instead of dragging them back to the DirDiff tab,
+    " :edit'ing the list into their own window, or auto-opening the first
+    " diff (see s:DirDiffFinishStreamingBackground() above).
+    if bufwinid(bufNr) <= 0
+        call s:DirDiffFinishStreamingBackground(bufNr)
+        return
+    endif
+
     let savedWin = win_getid()
     call <SID>GotoDiffWindow()
 
@@ -869,7 +935,7 @@ function! s:DirDiffFinishStreaming() abort
         call win_gotoid(savedWin)
         silent! execute "bwipeout! " . bufNr
         let s:DirDiffStatusBufNr = -1
-        redraw | echom "diff found no differences - directories match."
+        redraw | echom s:DirDiffNoDiffMessage() . " - directories match."
         return
     endif
 
