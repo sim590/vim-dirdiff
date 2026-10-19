@@ -1399,14 +1399,14 @@ endfunction
 " "diff" is never told about the pattern.  Instead every common file
 " becomes its own per-file job when its relative path matches,
 " non-matching entries are silently skipped and counted in a:hidden,
-" common subdirectories are always walked down to the files (bounded by
-" the same probe budget/depth caps), and one-sided entries are either
-" synthesized here (their matching files) or hidden (the rest,
-" including one-sided directories).  If the probe budget or depth cap
-" is hit while an include pattern is active, the remaining subtree
-" still collapses to one atomic "diff -r" job whose output is NOT
-" filtered -- an accepted edge case: the safety guards against a
-" pathological tree take precedence over filtering fidelity there.
+" common subdirectories are always walked down to the files, and
+" one-sided entries are either synthesized here (their matching files)
+" or hidden (the rest, including one-sided directories).  The depth and
+" probe-budget guards are NOT applied on this path: they only bound the
+" up-front fan-out partitioning walk, and falling back to an atomic
+" unfiltered "diff -r" job would defeat the pattern, so the whole tree
+" is walked instead (directory listings only -- non-matching files
+" still never get a diff job).
 "
 " a:units: List of units to append to; each is either [pathA, pathB]
 "          (an atomic "diff -r" job) or [dirA, dirB, 'no-r'] (a
@@ -1417,7 +1417,8 @@ endfunction
 "          handling.
 " a:probeBudget: single-element List (mutable counter shared across the
 "          whole recursive walk) decremented once per directory listing
-"          actually performed, bounding total round trips globally.
+"          actually performed, bounding total round trips globally.  Not
+"          applied while an include pattern is active (see above).
 " a:includeRegexes: List of regexes from s:DirDiffBuildIncludeRegexes();
 "          empty means "no filtering", the default, strictly unchanged
 "          behaviour.
@@ -1445,19 +1446,20 @@ endfunction
 " an entry only recurses further when BOTH sides report type == 'dir'
 " exactly.
 function! s:DirDiffCollectFanOutUnits(dirA, dirB, depth, probeBudget, units, onlyLines, includeRegexes, excludesRegexes, relPath, hidden) abort
-    if a:probeBudget[0] <= 0 || a:depth >= s:DirDiffFanOutMaxDepth
-        " Safety cap reached: fall back to one atomic "diff -r" job for
-        " the whole remaining subtree.  NOTE: when an include pattern is
-        " active this job's output is NOT filtered -- the pattern only
-        " ever prevents *queuing* a per-file job, it is never passed
-        " down to "diff" itself -- so non-matching entries inside this
-        " subtree still show up.  Accepted edge case: these guards exist
-        " to keep a pathological tree from stalling the up-front walk,
-        " and they take precedence over filtering fidelity here.
-        call add(a:units, [a:dirA, a:dirB])
-        return
+    " The depth/probe-budget guards bound the up-front walk that decides
+    " how to partition the fan-out; when one trips, the remaining subtree
+    " becomes a single atomic "diff -r" job (same results, just less
+    " parallelism).  That is wrong when an include pattern is active: the
+    " pattern is never passed down to "diff", so such a job would compare
+    " and report non-matching files.  The include path therefore always
+    " walks the whole tree (see the header comment).
+    if empty(a:includeRegexes)
+        if a:probeBudget[0] <= 0 || a:depth >= s:DirDiffFanOutMaxDepth
+            call add(a:units, [a:dirA, a:dirB])
+            return
+        endif
+        let a:probeBudget[0] -= 1
     endif
-    let a:probeBudget[0] -= 1
 
     let entriesA = s:DirDiffListDirTyped(a:dirA)
     let entriesB = s:DirDiffListDirTyped(a:dirB)
