@@ -851,13 +851,19 @@ endfunction
 " buffer number: no window is entered, no tab is switched, and the first
 " diff is not auto-opened -- that only makes sense while on screen.
 function! s:DirDiffFinishStreamingBackground(bufNr) abort
-    " Strip the "==> " marker left on the entry opened while streaming,
-    " before the sort below (same reason as the visible path).
+    " Remember the entry the user opened while streaming and strip its
+    " "==> " marker before the sort below (same reason as the visible
+    " path); b:currentDiff is remapped to the entry's new line after the
+    " sort.
     let curDiff = getbufvar(a:bufNr, 'currentDiff', 0)
-    if curDiff > 0
+    let curText = ''
+    if curDiff > s:DirDiffFirstDiffLine
         let curLine = getbufline(a:bufNr, curDiff)
-        if !empty(curLine) && curLine[0] =~# '^==> '
-            call setbufline(a:bufNr, curDiff, substitute(curLine[0], '^==> ', '    ', ''))
+        if !empty(curLine)
+            let curText = substitute(curLine[0], '^==> ', '    ', '')
+            if curText !=# curLine[0]
+                call setbufline(a:bufNr, curDiff, curText)
+            endif
         endif
     endif
 
@@ -883,6 +889,25 @@ function! s:DirDiffFinishStreamingBackground(bufNr) abort
         call setbufline(a:bufNr, s:DirDiffFirstDiffLine + 1, lines)
         call setbufvar(a:bufNr, '&modifiable', 0)
         call setbufvar(a:bufNr, '&modified', 0)
+    endif
+
+    " Put the "==> " marker back on the user's current entry and point
+    " b:currentDiff at its new line, so DirDiffNext()/DirDiffOpen()
+    " resume from there when the user comes back to this tab.
+    if curText != ''
+        let i = 0
+        for line in getbufline(a:bufNr, s:DirDiffFirstDiffLine + 1, '$')
+            if line ==# curText
+                let newLine = s:DirDiffFirstDiffLine + 1 + i
+                call setbufvar(a:bufNr, 'currentDiff', newLine)
+                call setbufvar(a:bufNr, '&modifiable', 1)
+                call setbufline(a:bufNr, newLine, substitute(line, '^    ', '==> ', ''))
+                call setbufvar(a:bufNr, '&modifiable', 0)
+                call setbufvar(a:bufNr, '&modified', 0)
+                break
+            endif
+            let i += 1
+        endfor
     endif
 endfunction
 
@@ -914,13 +939,18 @@ function! s:DirDiffFinishStreaming() abort
     let savedWin = win_getid()
     call <SID>GotoDiffWindow()
 
-    " A line the user already opened while jobs were still streaming in
-    " may still carry the "==> " highlight marker; strip it before the
-    " final sort below, since that marker would otherwise skew the
-    " alphabetical ordering of otherwise-identical entries (a bare "="
-    " does not collate the same way as the normal 4-space indent).
-    if exists('b:currentDiff')
+    " Remember the entry the user is on, if they opened one while the run
+    " was still streaming.  Its "==> " marker must be stripped before the
+    " final sort (a bare "=" does not collate the same way as the normal
+    " 4-space indent), and b:currentDiff is a line number the sort
+    " invalidates, so the entry is found again afterwards.  When there is
+    " one, the first diff is NOT auto-opened below: the user keeps their
+    " place instead.
+    let curDiff = exists('b:currentDiff') ? b:currentDiff : 0
+    let curText = ''
+    if curDiff > s:DirDiffFirstDiffLine
         call <SID>DeHighlightLine()
+        let curText = getline(curDiff)
     endif
 
     setlocal modifiable
@@ -954,13 +984,36 @@ function! s:DirDiffFinishStreaming() abort
     " <SID>DirDiffNext(), so that DirDiffNext()'s "are we still inside
     " the header?" check (line(".") < s:DirDiffFirstDiffLine) behaves
     " the same regardless of where the sort left the cursor.
+    " Put the "==> " marker back on the user's current entry, now that
+    " the sort is done.
+    if curText != ''
+        let newLine = 0
+        for i in range(s:DirDiffFirstDiffLine + 1, line('$'))
+            if getline(i) ==# curText
+                let newLine = i
+                break
+            endif
+        endfor
+        if newLine > 0
+            let b:currentDiff = newLine
+            setlocal modifiable
+            call setline(newLine, substitute(getline(newLine), '^    ', '==> ', ''))
+            setlocal nomodifiable
+            setlocal nomodified
+            exe newLine
+            call win_gotoid(savedWin)
+            redraw
+            return
+        endif
+    endif
+
     0
 
     call win_gotoid(savedWin)
 
-    " Open the first diff now that every entry is in and sorted, same
-    " as s:DirDiffFinalize() does for the classic synchronous path --
-    " never before the sort, and only once per run.
+    " No entry was open yet: open the first diff now that every entry is
+    " in and sorted, same as s:DirDiffFinalize() does for the classic
+    " synchronous path -- never before the sort, and only once per run.
     call <SID>DirDiffNext()
     redraw
 endfunction
