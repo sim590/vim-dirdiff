@@ -1743,6 +1743,11 @@ endfunction
 " Removes the highlight from the selected line in the diff window
 "
 function! <SID>DeHighlightLine()
+    " Nothing to dehighlight when no entry has been opened yet on this
+    " list (eg. the user pressed Enter on a freshly built list).
+    if !exists("b:currentDiff")
+        return
+    endif
     let savedLine = line(".")
     exe (b:currentDiff)
     let line = getline(".")
@@ -1779,6 +1784,10 @@ function! <SID>DirDiffNext()
     " first diff line open it
     if (line(".") < s:DirDiffFirstDiffLine)
         exe (s:DirDiffFirstDiffLine)
+        let b:currentDiff = line(".")
+    elseif !exists("b:currentDiff")
+        " No entry has been opened yet on this list: continue from the
+        " cursor line.
         let b:currentDiff = line(".")
     endif
     silent! exe (b:currentDiff + 1)
