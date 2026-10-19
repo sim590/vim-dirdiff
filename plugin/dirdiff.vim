@@ -862,7 +862,10 @@ function! s:DirDiffFinishStreamingBackground(bufNr) abort
         if !empty(curLine)
             let curText = substitute(curLine[0], '^==> ', '    ', '')
             if curText !=# curLine[0]
+                call setbufvar(a:bufNr, '&modifiable', 1)
                 call setbufline(a:bufNr, curDiff, curText)
+                call setbufvar(a:bufNr, '&modifiable', 0)
+                call setbufvar(a:bufNr, '&modified', 0)
             endif
         endif
     endif
