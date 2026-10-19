@@ -807,9 +807,8 @@ function! s:DirDiffStreamAppend(lines) abort
     call setbufvar(s:DirDiffStatusBufNr, '&modifiable', 0)
     call setbufvar(s:DirDiffStatusBufNr, '&modified', 0)
 
-    " The visual refresh (window switch + :redraw) is the expensive
-    " part -- a full synchronous screen repaint plus a window lookup/
-    " switch -- so it's only done at most once every
+    " The visual refresh (:redraw) is the expensive part -- a full
+    " synchronous screen repaint -- so it's only done at most once every
     " s:DirDiffRedrawThrottleSec, no matter how often this function
     " itself gets called in between.  Without this, a fan-out sub-job
     " producing its output over a long stretch of wall-clock time (eg.
@@ -826,18 +825,18 @@ function! s:DirDiffStreamAppend(lines) abort
     endif
     let s:DirDiffLastRedrawTime = reltime()
 
-    " Only refresh the visible screen when the DirDiff window is in the
-    " current tab page: otherwise the user is looking somewhere else, and
-    " both switching tabs and (worse) the <SID>Drop() fallback :edit'ing
-    " the list buffer into their own window would be very intrusive.  The
-    " result buffer itself is already updated by number above.
+    " Only refresh the screen when the DirDiff window is in the current
+    " tab page: otherwise the user is looking somewhere else (the buffer
+    " itself is already updated by number above).
     if bufwinid(s:DirDiffStatusBufNr) <= 0
         return
     endif
 
-    let savedWin = win_getid()
-    call <SID>GotoDiffWindow()
-    call win_gotoid(savedWin)
+    " Repaint with a plain :redraw -- never switch windows: every switch
+    " fires WinLeave/WinEnter, which disturbs whatever the user is doing
+    " in another window of the same tab (eg. vim-visual-multi cancels its
+    " selection on a window change).  :redraw repaints all windows, the
+    " DirDiff one included, without moving the cursor anywhere.
     redraw
 endfunction
 
@@ -900,12 +899,14 @@ function! s:DirDiffFinishStreaming() abort
     let bufNr = s:DirDiffStatusBufNr
     let s:DirDiffStreaming = 0
 
-    " bufwinid() only searches the current tab page.  When the user
-    " switched to another tab while a long run was streaming, finalize the
-    " buffer in place instead of dragging them back to the DirDiff tab,
-    " :edit'ing the list into their own window, or auto-opening the first
-    " diff (see s:DirDiffFinishStreamingBackground() above).
-    if bufwinid(bufNr) <= 0
+    " Only take over the screen when the user is actually sitting in the
+    " DirDiff list window.  Otherwise they are working elsewhere (another
+    " tab, or another window of this tab): finalize the buffer in place by
+    " number -- no window switch, no :edit'ing the list into their window,
+    " no auto-open of the first diff (see
+    " s:DirDiffFinishStreamingBackground() above).  bufwinid() only
+    " searches the current tab page, hence the -1 case too.
+    if win_getid() != bufwinid(bufNr)
         call s:DirDiffFinishStreamingBackground(bufNr)
         return
     endif
